@@ -17,10 +17,12 @@
 #include "SwiftInterfaceGenContext.h"
 #include "SourceKit/Core/LangSupport.h"
 #include "SourceKit/Support/Concurrency.h"
+#include "SourceKit/Support/Statistic.h"
 #include "SourceKit/Support/ThreadSafeRefCntPtr.h"
 #include "SourceKit/Support/Tracing.h"
 #include "swift/Basic/ThreadSafeRefCounted.h"
 #include "swift/IDE/Formatting.h"
+#include "swift/IDE/Refactoring.h"
 #include "swift/Index/IndexSymbol.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/StringMap.h"
@@ -43,6 +45,7 @@ namespace swift {
 namespace ide {
   class CodeCompletionCache;
   class OnDiskCodeCompletionCache;
+  class SourceEditConsumer;
   enum class CodeCompletionDeclKind;
   enum class SyntaxNodeKind : uint8_t;
   enum class SyntaxStructureKind : uint8_t;
@@ -88,7 +91,8 @@ public:
 
   ImmutableTextSnapshotRef getLatestSnapshot() const;
 
-  void parse(ImmutableTextSnapshotRef Snapshot, SwiftLangSupport &Lang);
+  void parse(ImmutableTextSnapshotRef Snapshot, SwiftLangSupport &Lang,
+             bool BuildSyntaxTree);
   void readSyntaxInfo(EditorConsumer& consumer);
   void readSemanticInfo(ImmutableTextSnapshotRef Snapshot,
                         EditorConsumer& Consumer);
@@ -141,6 +145,7 @@ class SessionCache : public ThreadSafeRefCountedBase<SessionCache> {
   std::vector<Completion *> sortedCompletions;
   CompletionKind completionKind;
   bool completionHasExpectedTypes;
+  bool completionMayUseImplicitMemberExpr;
   FilterRules filterRules;
   llvm::sys::Mutex mtx;
 
@@ -148,10 +153,12 @@ public:
   SessionCache(CompletionSink &&sink,
                std::unique_ptr<llvm::MemoryBuffer> &&buffer,
                std::vector<std::string> &&args, CompletionKind completionKind,
-               bool hasExpectedTypes, FilterRules filterRules)
+               bool hasExpectedTypes, bool mayUseImplicitMemberExpr,
+               FilterRules filterRules)
       : buffer(std::move(buffer)), args(std::move(args)), sink(std::move(sink)),
         completionKind(completionKind),
         completionHasExpectedTypes(hasExpectedTypes),
+        completionMayUseImplicitMemberExpr(mayUseImplicitMemberExpr),
         filterRules(std::move(filterRules)) {}
   void setSortedCompletions(std::vector<Completion *> &&completions);
   ArrayRef<Completion *> getSortedCompletions();
@@ -160,6 +167,7 @@ public:
   const FilterRules &getFilterRules();
   CompletionKind getCompletionKind();
   bool getCompletionHasExpectedTypes();
+  bool getCompletionMayUseImplicitMemberExpr();
 };
 typedef RefPtr<SessionCache> SessionCacheRef;
 
@@ -211,6 +219,45 @@ struct SwiftCustomCompletions
   std::vector<CustomCompletionInfo> customCompletions;
 };
 
+class RequestRefactoringEditConsumer: public swift::ide::SourceEditConsumer,
+                                      public swift::DiagnosticConsumer {
+  class Implementation;
+  Implementation &Impl;
+public:
+  RequestRefactoringEditConsumer(CategorizedEditsReceiver Receiver);
+  ~RequestRefactoringEditConsumer();
+  void accept(swift::SourceManager &SM, swift::ide::RegionType RegionType,
+              ArrayRef<swift::ide::Replacement> Replacements) override;
+  void handleDiagnostic(swift::SourceManager &SM, swift::SourceLoc Loc,
+                        swift::DiagnosticKind Kind,
+                        StringRef FormatString,
+                        ArrayRef<swift::DiagnosticArgument> FormatArgs,
+                        const swift::DiagnosticInfo &Info) override;
+};
+
+class RequestRenameRangeConsumer : public swift::ide::FindRenameRangesConsumer,
+                                   public swift::DiagnosticConsumer {
+  class Implementation;
+  Implementation &Impl;
+
+public:
+  RequestRenameRangeConsumer(CategorizedRenameRangesReceiver Receiver);
+  ~RequestRenameRangeConsumer();
+  void accept(swift::SourceManager &SM, swift::ide::RegionType RegionType,
+              ArrayRef<swift::ide::RenameRangeDetail> Ranges) override;
+  void handleDiagnostic(swift::SourceManager &SM, swift::SourceLoc Loc,
+                        swift::DiagnosticKind Kind,
+                        StringRef FormatString,
+                        ArrayRef<swift::DiagnosticArgument> FormatArgs,
+                        const swift::DiagnosticInfo &Info) override;
+};
+
+struct SwiftStatistics {
+#define SWIFT_STATISTIC(VAR, UID, DESC)                                        \
+  Statistic VAR{UIdent{"source.statistic." #UID}, DESC};
+#include "SwiftStatistics.def"
+};
+
 class SwiftLangSupport : public LangSupport {
   SourceKit::Context &SKCtx;
   std::string RuntimeResourcePath;
@@ -221,6 +268,7 @@ class SwiftLangSupport : public LangSupport {
   ThreadSafeRefCntPtr<SwiftPopularAPI> PopularAPI;
   CodeCompletion::SessionCacheMap CCSessions;
   ThreadSafeRefCntPtr<SwiftCustomCompletions> CustomCompletions;
+  SwiftStatistics Stats;
 
 public:
   explicit SwiftLangSupport(SourceKit::Context &SKCtx);
@@ -238,10 +286,14 @@ public:
     return CCCache;
   }
 
+  SwiftStatistics &getStatistics() { return Stats; }
+
   static SourceKit::UIdent getUIDForDecl(const swift::Decl *D,
                                          bool IsRef = false);
   static SourceKit::UIdent getUIDForExtensionOfDecl(const swift::Decl *D);
   static SourceKit::UIdent getUIDForLocalVar(bool IsRef = false);
+  static SourceKit::UIdent getUIDForRefactoringKind(
+      swift::ide::RefactoringKind Kind);
   static SourceKit::UIdent getUIDForCodeCompletionDeclKind(
       swift::ide::CodeCompletionDeclKind Kind, bool IsRef = false);
   static SourceKit::UIdent getUIDForAccessor(const swift::ValueDecl *D,
@@ -259,6 +311,12 @@ public:
                                            bool isRef);
 
   static SourceKit::UIdent getUIDForRangeKind(swift::ide::RangeKind Kind);
+
+  static SourceKit::UIdent getUIDForRegionType(swift::ide::RegionType Type);
+
+  static SourceKit::UIdent getUIDForRefactoringRangeKind(swift::ide::RefactoringRangeKind Kind);
+
+  static Optional<UIdent> getUIDForDeclAttribute(const swift::DeclAttribute *Attr);
 
   static std::vector<UIdent> UIDsFromDeclAttributes(const swift::DeclAttributes &Attrs);
 
@@ -297,9 +355,9 @@ public:
                                              swift::Type BaseTy,
                                              llvm::raw_ostream &OS);
 
-  static void printFullyAnnotatedSynthesizedDeclaration(
-                                            const swift::ValueDecl *VD,
-                                            swift::NominalTypeDecl *Target,
+  static void
+  printFullyAnnotatedSynthesizedDeclaration(const swift::ValueDecl *VD,
+                                            swift::TypeOrExtensionDecl Target,
                                             llvm::raw_ostream &OS);
 
   /// Tries to resolve the path to the real file-system path. If it fails it
@@ -358,8 +416,9 @@ public:
                                  StringRef Name,
                                  StringRef HeaderName,
                                  ArrayRef<const char *> Args,
+                                 bool UsingSwiftArgs,
                                  bool SynthesizedExtensions,
-                                 Optional<unsigned> swiftVersion) override;
+                                 StringRef swiftVersion) override;
 
   void editorOpenSwiftSourceInterface(StringRef Name,
                                       StringRef SourceName,
@@ -389,8 +448,9 @@ public:
 
   void getCursorInfo(StringRef Filename, unsigned Offset,
                      unsigned Length, bool Actionables,
+                     bool CancelOnSubsequentRequest,
                      ArrayRef<const char *> Args,
-                     std::function<void(const CursorInfo &)> Receiver) override;
+                 std::function<void(const CursorInfoData &)> Receiver) override;
 
   void getNameInfo(StringRef Filename, unsigned Offset,
                    NameTranslatingInfo &Input,
@@ -398,16 +458,36 @@ public:
                    std::function<void(const NameTranslatingInfo &)> Receiver) override;
 
   void getRangeInfo(StringRef Filename, unsigned Offset, unsigned Length,
-                    ArrayRef<const char *> Args,
+                    bool CancelOnSubsequentRequest, ArrayRef<const char *> Args,
                     std::function<void(const RangeInfo&)> Receiver) override;
 
   void getCursorInfoFromUSR(
-      StringRef Filename, StringRef USR, ArrayRef<const char *> Args,
-      std::function<void(const CursorInfo &)> Receiver) override;
+      StringRef Filename, StringRef USR, bool CancelOnSubsequentRequest,
+      ArrayRef<const char *> Args,
+      std::function<void(const CursorInfoData &)> Receiver) override;
 
   void findRelatedIdentifiersInFile(StringRef Filename, unsigned Offset,
+                                    bool CancelOnSubsequentRequest,
                                     ArrayRef<const char *> Args,
               std::function<void(const RelatedIdentsInfo &)> Receiver) override;
+
+  void syntacticRename(llvm::MemoryBuffer *InputBuf,
+                       ArrayRef<RenameLocations> RenameLocations,
+                       ArrayRef<const char*> Args,
+                       CategorizedEditsReceiver Receiver) override;
+
+  void findRenameRanges(llvm::MemoryBuffer *InputBuf,
+                        ArrayRef<RenameLocations> RenameLocations,
+                        ArrayRef<const char *> Args,
+                        CategorizedRenameRangesReceiver Receiver) override;
+
+  void findLocalRenameRanges(StringRef Filename, unsigned Line, unsigned Column,
+                             unsigned Length, ArrayRef<const char *> Args,
+                             CategorizedRenameRangesReceiver Receiver) override;
+
+  void semanticRefactoring(StringRef Filename, SemanticRefactoringInfo Info,
+                           ArrayRef<const char*> Args,
+                           CategorizedEditsReceiver Receiver) override;
 
   void getDocInfo(llvm::MemoryBuffer *InputBuf,
                   StringRef ModuleName,
@@ -422,6 +502,14 @@ public:
 
   void findModuleGroups(StringRef ModuleName, ArrayRef<const char *> Args,
                std::function<void(ArrayRef<StringRef>, StringRef Error)> Receiver) override;
+
+  void getStatistics(StatisticsReceiver) override;
+
+private:
+  swift::SourceFile *getSyntacticSourceFile(llvm::MemoryBuffer *InputBuf,
+                                            ArrayRef<const char *> Args,
+                                            swift::CompilerInstance &ParseCI,
+                                            std::string &Error);
 };
 
 namespace trace {

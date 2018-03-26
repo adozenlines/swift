@@ -21,6 +21,7 @@
 #include "swift/Basic/UUID.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/Range.h"
+#include "swift/Basic/OptimizationMode.h"
 #include "swift/Basic/Version.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/AttrKind.h"
@@ -44,6 +45,7 @@ struct PrintOptions;
 class Decl;
 class ClassDecl;
 class GenericFunctionType;
+class LazyConformanceLoader;
 class TrailingWhereClause;
 
 /// TypeAttributes - These are attributes that may be applied to types.
@@ -56,6 +58,7 @@ public:
   /// If this is an empty attribute specifier, then this will be an invalid loc.
   SourceLoc AtLoc;
   Optional<StringRef> convention = None;
+  Optional<StringRef> conventionWitnessMethodProtocol = None;
 
   // For an opened existential type, the known ID.
   Optional<UUID> OpenedID;
@@ -102,13 +105,18 @@ public:
   
   bool hasConvention() const { return convention.hasValue(); }
   StringRef getConvention() const { return *convention; }
-  
-  bool hasOwnership() const { return getOwnership() != Ownership::Strong; }
-  Ownership getOwnership() const {
-    if (has(TAK_sil_weak)) return Ownership::Weak;
-    if (has(TAK_sil_unowned)) return Ownership::Unowned;
-    if (has(TAK_sil_unmanaged)) return Ownership::Unmanaged;
-    return Ownership::Strong;
+
+  bool hasOwnership() const {
+    return getOwnership() != ReferenceOwnership::Strong;
+  }
+  ReferenceOwnership getOwnership() const {
+    if (has(TAK_sil_weak))
+      return ReferenceOwnership::Weak;
+    if (has(TAK_sil_unowned))
+      return ReferenceOwnership::Unowned;
+    if (has(TAK_sil_unmanaged))
+      return ReferenceOwnership::Unmanaged;
+    return ReferenceOwnership::Strong;
   }
   
   void clearOwnership() {
@@ -206,29 +214,19 @@ protected:
   enum { NumObjCAttrBits = NumDeclAttrBits + 3 };
   static_assert(NumObjCAttrBits <= 32, "fits in an unsigned");
 
-  class AccessibilityAttrBitFields {
-    friend class AbstractAccessibilityAttr;
+  class AccessControlAttrBitFields {
+    friend class AbstractAccessControlAttr;
     unsigned : NumDeclAttrBits;
 
     unsigned AccessLevel : 3;
   };
-  enum { NumAccessibilityAttrBits = NumDeclAttrBits + 3 };
-  static_assert(NumAccessibilityAttrBits <= 32, "fits in an unsigned");
-
-  class AutoClosureAttrBitFields {
-    friend class AutoClosureAttr;
-    unsigned : NumDeclAttrBits;
-
-    unsigned Escaping : 1;
-  };
-  enum { NumAutoClosureAttrBits = NumDeclAttrBits + 1 };
-  static_assert(NumAutoClosureAttrBits <= 32, "fits in an unsigned");
+  enum { NumAccessControlAttrBits = NumDeclAttrBits + 3 };
+  static_assert(NumAccessControlAttrBits <= 32, "fits in an unsigned");
 
   union {
     DeclAttrBitFields DeclAttrBits;
     ObjCAttrBitFields ObjCAttrBits;
-    AccessibilityAttrBitFields AccessibilityAttrBits;
-    AutoClosureAttrBitFields AutoClosureAttrBits;
+    AccessControlAttrBitFields AccessControlAttrBits;
   };
 
   DeclAttribute *Next = nullptr;
@@ -292,12 +290,17 @@ public:
     OnConstructor      = 1 << 24,
     OnDestructor       = 1 << 25,
     OnFunc             = 1 << 26,
+    OnAccessor         = OnFunc,
     OnEnumElement      = 1 << 27,
 
     OnGenericTypeParam = 1 << 28,
     OnAssociatedType   = 1 << 29,
     OnParam            = 1 << 30,
     OnModule           = 1 << 31,
+
+    // Cannot have any attributes.
+    OnMissingMember = 0,
+    OnPoundDiagnostic = 0,
 
     // More coarse-grained aggregations for use in Attr.def.
     OnOperator = OnInfixOperator|OnPrefixOperator|OnPostfixOperator,
@@ -865,69 +868,51 @@ public:
   }
 };
 
-/// Represents any sort of accessibility modifier.
-class AbstractAccessibilityAttr : public DeclAttribute {
+/// Represents any sort of access control modifier.
+class AbstractAccessControlAttr : public DeclAttribute {
 protected:
-  AbstractAccessibilityAttr(DeclAttrKind DK, SourceLoc atLoc, SourceRange range,
-                            Accessibility access, bool implicit)
+  AbstractAccessControlAttr(DeclAttrKind DK, SourceLoc atLoc, SourceRange range,
+                            AccessLevel access, bool implicit)
       : DeclAttribute(DK, atLoc, range, implicit) {
-    AccessibilityAttrBits.AccessLevel = static_cast<unsigned>(access);
-    assert(getAccess() == access && "not enough bits for accessibility");
+    AccessControlAttrBits.AccessLevel = static_cast<unsigned>(access);
+    assert(getAccess() == access && "not enough bits for access control");
   }
 
 public:
-  Accessibility getAccess() const {
-    return static_cast<Accessibility>(AccessibilityAttrBits.AccessLevel);
+  AccessLevel getAccess() const {
+    return static_cast<AccessLevel>(AccessControlAttrBits.AccessLevel);
   }
 
   static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_Accessibility ||
-           DA->getKind() == DAK_SetterAccessibility;
+    return DA->getKind() == DAK_AccessControl ||
+           DA->getKind() == DAK_SetterAccess;
   }
 };
 
 /// Represents a 'private', 'internal', or 'public' marker on a declaration.
-class AccessibilityAttr : public AbstractAccessibilityAttr {
+class AccessControlAttr : public AbstractAccessControlAttr {
 public:
-  AccessibilityAttr(SourceLoc atLoc, SourceRange range, Accessibility access,
+  AccessControlAttr(SourceLoc atLoc, SourceRange range, AccessLevel access,
                     bool implicit = false)
-      : AbstractAccessibilityAttr(DAK_Accessibility, atLoc, range, access,
+      : AbstractAccessControlAttr(DAK_AccessControl, atLoc, range, access,
                                   implicit) {}
 
   static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_Accessibility;
+    return DA->getKind() == DAK_AccessControl;
   }
 };
 
 /// Represents a 'private', 'internal', or 'public' marker for a setter on a
 /// declaration.
-class SetterAccessibilityAttr : public AbstractAccessibilityAttr {
+class SetterAccessAttr : public AbstractAccessControlAttr {
 public:
-  SetterAccessibilityAttr(SourceLoc atLoc, SourceRange range,
-                          Accessibility access, bool implicit = false)
-      : AbstractAccessibilityAttr(DAK_SetterAccessibility, atLoc, range, access,
+  SetterAccessAttr(SourceLoc atLoc, SourceRange range,
+                          AccessLevel access, bool implicit = false)
+      : AbstractAccessControlAttr(DAK_SetterAccess, atLoc, range, access,
                                   implicit) {}
 
   static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_SetterAccessibility;
-  }
-};
-
-/// Represents the autoclosure attribute.
-class AutoClosureAttr : public DeclAttribute {
-public:
-  AutoClosureAttr(SourceLoc atLoc, SourceRange range, bool escaping,
-                  bool implicit = false)
-    : DeclAttribute(DAK_AutoClosure, atLoc, range, implicit)
-  {
-    AutoClosureAttrBits.Escaping = escaping;
-  }
-
-  /// Determine whether this autoclosure is escaping.
-  bool isEscaping() const { return AutoClosureAttrBits.Escaping; }
-
-  static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_AutoClosure;
+    return DA->getKind() == DAK_SetterAccess;
   }
 };
 
@@ -945,6 +930,23 @@ public:
   InlineKind getKind() const { return Kind; }
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DAK_Inline;
+  }
+};
+
+/// Represents the optimize attribute.
+class OptimizeAttr : public DeclAttribute {
+  OptimizationMode Mode;
+public:
+  OptimizeAttr(SourceLoc atLoc, SourceRange range, OptimizationMode mode)
+    : DeclAttribute(DAK_Optimize, atLoc, range, /*Implicit=*/false),
+      Mode(mode) {}
+
+  OptimizeAttr(OptimizationMode mode)
+    : OptimizeAttr(SourceLoc(), SourceRange(), mode) {}
+
+  OptimizationMode getMode() const { return Mode; }
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DAK_Optimize;
   }
 };
 
@@ -968,24 +970,27 @@ public:
 
 
 /// Represents weak/unowned/unowned(unsafe) decl modifiers.
-class OwnershipAttr : public DeclAttribute {
-  const Ownership ownership;
+class ReferenceOwnershipAttr : public DeclAttribute {
+  const ReferenceOwnership ownership;
+
 public:
-  OwnershipAttr(SourceRange range, Ownership kind)
-    : DeclAttribute(DAK_Ownership, range.Start, range, /*Implicit=*/false),
-      ownership(kind) {}
+  ReferenceOwnershipAttr(SourceRange range, ReferenceOwnership kind)
+      : DeclAttribute(DAK_ReferenceOwnership, range.Start, range,
+                      /*Implicit=*/false),
+        ownership(kind) {}
 
-  OwnershipAttr(Ownership kind) : OwnershipAttr(SourceRange(), kind) {}
+  ReferenceOwnershipAttr(ReferenceOwnership kind)
+      : ReferenceOwnershipAttr(SourceRange(), kind) {}
 
-  Ownership get() const { return ownership; }
+  ReferenceOwnership get() const { return ownership; }
 
   /// Returns a copy of this attribute without any source information.
-  OwnershipAttr *clone(ASTContext &context) const {
-    return new (context) OwnershipAttr(get());
+  ReferenceOwnershipAttr *clone(ASTContext &context) const {
+    return new (context) ReferenceOwnershipAttr(get());
   }
 
   static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_Ownership;
+    return DA->getKind() == DAK_ReferenceOwnership;
   }
 };
 
@@ -1041,18 +1046,24 @@ public:
 /// synthesized conformances.
 class SynthesizedProtocolAttr : public DeclAttribute {
   KnownProtocolKind ProtocolKind;
+  LazyConformanceLoader *Loader;
 
 public:
-  SynthesizedProtocolAttr(KnownProtocolKind protocolKind)
+  SynthesizedProtocolAttr(KnownProtocolKind protocolKind,
+                          LazyConformanceLoader *Loader)
     : DeclAttribute(DAK_SynthesizedProtocol, SourceLoc(), SourceRange(),
                     /*Implicit=*/true),
-      ProtocolKind(protocolKind)
+      ProtocolKind(protocolKind), Loader(Loader)
   {
   }
 
   /// Retrieve the known protocol kind naming the protocol to be
   /// synthesized.
   KnownProtocolKind getProtocolKind() const { return ProtocolKind; }
+
+  /// Retrieve the lazy loader that will be used to populate the
+  /// synthesized conformance.
+  LazyConformanceLoader *getLazyLoader() const { return Loader; }
 
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DAK_SynthesizedProtocol;
@@ -1158,21 +1169,98 @@ public:
   }
 };
 
-/// Defines the @NSKeyedArchiveLegacyAttr attribute.
-class NSKeyedArchiveLegacyAttr : public DeclAttribute {
+/// A limited variant of \c @objc that's used for classes with generic ancestry.
+class ObjCRuntimeNameAttr : public DeclAttribute {
+  static StringRef getSimpleName(const ObjCAttr &Original) {
+    assert(Original.hasName());
+    return Original.getName()->getSimpleName().str();
+  }
 public:
-  NSKeyedArchiveLegacyAttr(StringRef Name, SourceLoc AtLoc, SourceRange Range, bool Implicit)
-    : DeclAttribute(DAK_NSKeyedArchiveLegacy, AtLoc, Range, Implicit),
+  ObjCRuntimeNameAttr(StringRef Name, SourceLoc AtLoc, SourceRange Range,
+                      bool Implicit)
+    : DeclAttribute(DAK_ObjCRuntimeName, AtLoc, Range, Implicit),
       Name(Name) {}
 
-  NSKeyedArchiveLegacyAttr(StringRef Name, bool Implicit)
-    : NSKeyedArchiveLegacyAttr(Name, SourceLoc(), SourceRange(), /*Implicit=*/true) {}
+  explicit ObjCRuntimeNameAttr(const ObjCAttr &Original)
+    : ObjCRuntimeNameAttr(getSimpleName(Original), Original.AtLoc,
+                          Original.Range, Original.isImplicit()) {}
 
-  /// The legacy mangled name.
   const StringRef Name;
 
   static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_NSKeyedArchiveLegacy;
+    return DA->getKind() == DAK_ObjCRuntimeName;
+  }
+};
+
+/// Attribute that specifies a protocol conformance that has been restated
+/// (i.e., is redundant) but should still be emitted in Objective-C metadata.
+class RestatedObjCConformanceAttr : public DeclAttribute {
+public:
+  explicit RestatedObjCConformanceAttr(ProtocolDecl *proto)
+    : DeclAttribute(DAK_RestatedObjCConformance, SourceLoc(), SourceRange(),
+                    /*Implicit=*/true),
+      Proto(proto) {}
+
+  /// The protocol to which this type conforms.
+  ProtocolDecl * const Proto;
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DAK_RestatedObjCConformance;
+  }
+};
+
+/// Attached to type declarations synthesized by the Clang importer.
+///
+/// Used to control manglings.
+class ClangImporterSynthesizedTypeAttr : public DeclAttribute {
+public:
+  enum class Kind : char {
+    /// A struct synthesized by the importer to represent an NSError with a
+    /// particular domain, as specified by an enum with the \c ns_error_domain
+    /// Clang attribute.
+    ///
+    /// This one is for enums with names.
+    NSErrorWrapper,
+
+    /// A struct synthesized by the importer to represent an NSError with a
+    /// particular domain, as specified by an enum with the \c ns_error_domain
+    /// Clang attribute.
+    ///
+    /// This one is for anonymous enums that are immediately typedef'd, giving
+    /// them a unique name for linkage purposes according to the C++ standard.
+    NSErrorWrapperAnon,
+  };
+
+  /// The (Clang) name of the declaration that caused this type declaration to
+  /// be synthesized.
+  ///
+  /// Must be a valid Swift identifier as well, for mangling purposes.
+  const StringRef originalTypeName;
+  const Kind kind;
+
+  explicit ClangImporterSynthesizedTypeAttr(StringRef originalTypeName,
+                                            Kind kind)
+    : DeclAttribute(DAK_ClangImporterSynthesizedType, SourceLoc(),
+                    SourceRange(), /*Implicit=*/true),
+      originalTypeName(originalTypeName), kind(kind) {
+    assert(!originalTypeName.empty());
+  }
+
+  StringRef getManglingName() const {
+    return manglingNameForKind(kind);
+  }
+
+  static StringRef manglingNameForKind(Kind kind) {
+    switch (kind) {
+    case Kind::NSErrorWrapper:
+      return "e";
+    case Kind::NSErrorWrapperAnon:
+      return "E";
+    }
+  }
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DAK_ClangImporterSynthesizedType;
   }
 };
 

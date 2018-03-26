@@ -11,29 +11,39 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "patternmatch-silgen"
-#include "SILGen.h"
-#include "Scope.h"
 #include "Cleanup.h"
 #include "ExitableFullExpr.h"
 #include "Initialization.h"
+#include "LValue.h"
 #include "RValue.h"
-#include "llvm/ADT/MapVector.h"
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/FormattedStream.h"
+#include "SILGen.h"
+#include "Scope.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/SILOptions.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/ProfileCounter.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILUndef.h"
 #include "swift/SIL/TypeLowering.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/FormattedStream.h"
 
 using namespace swift;
 using namespace Lowering;
+
+//===----------------------------------------------------------------------===//
+//                             Pattern Utilities
+//===----------------------------------------------------------------------===//
+
+// TODO: These routines should probably be refactored into their own file since
+// they have nothing to do with the implementation of SILGenPattern
+// specifically.
 
 /// Shallow-dump a pattern node one level deep for debug purposes.
 static void dumpPattern(const Pattern *p, llvm::raw_ostream &os) {
@@ -290,6 +300,10 @@ static Pattern *getSimilarSpecializingPattern(Pattern *p, Pattern *first) {
   llvm_unreachable("Unhandled PatternKind in switch.");
 }
 
+//===----------------------------------------------------------------------===//
+//                           SILGenPattern Emission
+//===----------------------------------------------------------------------===//
+
 namespace {
 
 /// A row which we intend to specialize.
@@ -302,6 +316,9 @@ struct RowToSpecialize {
 
   /// Whether the row will be irrefutable after this specialization.
   bool Irrefutable;
+
+  /// Profile Count of hte row we intend to specialize.
+  ProfileCounter Count;
 };
 
 /// Changes that we wish to apply to a row which we have specialized.
@@ -392,6 +409,8 @@ class PatternMatchEmission {
   CleanupsDepth PatternMatchStmtDepth;
   llvm::MapVector<CaseStmt*, std::pair<SILBasicBlock*, bool>> SharedCases;
 
+  llvm::DenseMap<VarDecl*, SILValue> Temporaries;
+
   using CompletionHandlerTy =
     llvm::function_ref<void(PatternMatchEmission &, ArgArray, ClauseRow &)>;
   CompletionHandlerTy CompletionHandler;
@@ -400,13 +419,26 @@ public:
   PatternMatchEmission(SILGenFunction &SGF, Stmt *S,
                        CompletionHandlerTy completionHandler)
     : SGF(SGF), PatternMatchStmt(S),
-      PatternMatchStmtDepth(SGF.getCleanupsDepth()),
       CompletionHandler(completionHandler) {}
+
+  Optional<SILLocation> getSubjectLocationOverride(SILLocation loc) const {
+    if (auto *Switch = dyn_cast<SwitchStmt>(PatternMatchStmt))
+      if (!Switch->isImplicit())
+        return SILLocation(Switch->getSubjectExpr());
+    return None;
+  }
 
   void emitDispatch(ClauseMatrix &matrix, ArgArray args,
                     const FailureHandler &failure);
 
-  JumpDest getSharedCaseBlockDest(CaseStmt *caseStmt, bool hasFallthroughTo);
+  void initSharedCaseBlockDest(CaseStmt *caseBlock, bool hasFallthroughTo);
+
+  void emitAddressOnlyAllocations();
+
+  void emitAddressOnlyInitialization(VarDecl *dest, SILValue value);
+
+  JumpDest getSharedCaseBlockDest(CaseStmt *caseStmt);
+
   void emitSharedCaseBlocks();
 
   void emitCaseBody(CaseStmt *caseBlock);
@@ -454,11 +486,13 @@ private:
                       const FailureHandler &failure);
   void emitEnumElementDispatchWithOwnership(
       ArrayRef<RowToSpecialize> rows, ConsumableManagedValue src,
-      const SpecializationHandler &handleSpec, const FailureHandler &failure);
+      const SpecializationHandler &handleSpec, const FailureHandler &failure,
+      ProfileCounter defaultCaseCount);
   void emitEnumElementDispatch(ArrayRef<RowToSpecialize> rows,
                                ConsumableManagedValue src,
                                const SpecializationHandler &handleSpec,
-                               const FailureHandler &failure);
+                               const FailureHandler &failure,
+                               ProfileCounter defaultCaseCount);
   void emitBoolDispatch(ArrayRef<RowToSpecialize> rows,
                         ConsumableManagedValue src,
                         const SpecializationHandler &handleSpec,
@@ -467,6 +501,10 @@ private:
 
 /// A handle to a row in a clause matrix. Does not own memory; use of the
 /// ClauseRow must be dominated by its originating ClauseMatrix.
+///
+/// TODO: This should be refactored into a more general formulation that uses a
+/// child template pattern to inject our logic. This will then allow us to
+/// inject "mock" objects in a unittest file.
 class ClauseRow {
   friend class ClauseMatrix;
   
@@ -872,7 +910,7 @@ public:
       assert(operand.getFinalConsumption() !=
                  CastConsumptionKind::TakeOnSuccess &&
              "When compiling with sil ownership take on success is disabled");
-      // No unforwarding is needed, we always copy.
+      // No unforwarding is needed, we always borrow/copy.
       return false;
     }
 
@@ -947,6 +985,7 @@ chooseNecessaryColumn(const ClauseMatrix &matrix, unsigned firstRow) {
   for (unsigned c = 0; c != numColumns; ++c) {
     unsigned constructorPrefix = getConstructorPrefix(matrix, firstRow, c);
     if (constructorPrefix > longestConstructorPrefix) {
+      longestConstructorPrefix = constructorPrefix;
       bestColumn = c;
     }
   }
@@ -1045,7 +1084,8 @@ void PatternMatchEmission::emitWildcardDispatch(ClauseMatrix &clauses,
 
   bool hasMultipleItems = false;
   if (auto *caseStmt = dyn_cast<CaseStmt>(stmt)) {
-    hasMultipleItems = caseStmt->getCaseLabelItems().size() > 1;
+    hasMultipleItems = clauses[row].hasFallthroughTo() ||
+      caseStmt->getCaseLabelItems().size() > 1;
   }
 
   // Bind the rest of the patterns.
@@ -1112,6 +1152,7 @@ void PatternMatchEmission::bindRefutablePattern(Pattern *pattern,
 void PatternMatchEmission::bindExprPattern(ExprPattern *pattern,
                                            ConsumableManagedValue value,
                                            const FailureHandler &failure) {
+  DebugLocOverrideRAII LocOverride{SGF.B, getSubjectLocationOverride(pattern)};
   FullExpr scope(SGF.Cleanups, CleanupLocation(pattern));
   bindVariable(pattern, pattern->getMatchVar(), value,
                pattern->getType()->getCanonicalType(),
@@ -1205,12 +1246,12 @@ void PatternMatchEmission::bindVariable(SILLocation loc, VarDecl *var,
   // If this binding is one of multiple patterns, each individual binding
   // will just be let, and then the chosen value will get forwarded into
   // a var box in the final shared case block.
-  bool forcedLet = hasMultipleItems && !var->isLet();
-  if (forcedLet)
-    var->setLet(true);
+  bool forcedLet = var->isLet();
+  if (hasMultipleItems && !var->isLet())
+    forcedLet = true;
   
   // Initialize the variable value.
-  InitializationPtr init = SGF.emitInitializationForVarDecl(var);
+  InitializationPtr init = SGF.emitInitializationForVarDecl(var, forcedLet);
 
   RValue rv(SGF, loc, formalValueType, value.getFinalManagedValue());
   if (shouldTake(value, isIrrefutable)) {
@@ -1218,9 +1259,6 @@ void PatternMatchEmission::bindVariable(SILLocation loc, VarDecl *var,
   } else {
     std::move(rv).copyInto(SGF, loc, init.get());
   }
-  
-  if (forcedLet)
-    var->setLet(false);
 }
 
 /// Evaluate a guard expression and, if it returns false, branch to
@@ -1310,9 +1348,15 @@ void PatternMatchEmission::emitSpecializedDispatch(ClauseMatrix &clauses,
   auto addRowToSpecialize = [&](Pattern *pattern, unsigned rowIndex) {
     assert(getSpecializingPattern(clauses[rowIndex][column]) == pattern);
     bool irrefutable = clauses[rowIndex].isIrrefutableAfterSpecializing(column);
-    rowsToSpecialize.push_back({pattern, rowIndex, irrefutable});
+    auto caseBlock = clauses[rowIndex].getClientData<CaseStmt>();
+    ProfileCounter count = ProfileCounter();
+    if (caseBlock) {
+      count = SGF.loadProfilerCount(caseBlock);
+    }
+    rowsToSpecialize.push_back({pattern, rowIndex, irrefutable, count});
   };
 
+  ProfileCounter defaultCaseCount = ProfileCounter();
   Pattern *firstSpecializer = getSpecializingPattern(clauses[firstRow][column]);
   assert(firstSpecializer && "specializing unspecializable row?");
   addRowToSpecialize(firstSpecializer, firstRow);
@@ -1321,7 +1365,13 @@ void PatternMatchEmission::emitSpecializedDispatch(ClauseMatrix &clauses,
   for (++lastRow; lastRow != clauses.rows(); ++lastRow) {
     Pattern *specializer =
       getSimilarSpecializingPattern(clauses[lastRow][column], firstSpecializer);
-    if (!specializer) break;
+    if (!specializer) {
+      auto caseBlock = clauses[lastRow].getClientData<CaseStmt>();
+      if (caseBlock) {
+        defaultCaseCount = SGF.loadProfilerCount(caseBlock);
+      }
+      break;
+    }
     addRowToSpecialize(specializer, lastRow);
   }
   assert(lastRow - firstRow == rowsToSpecialize.size());
@@ -1366,7 +1416,8 @@ void PatternMatchEmission::emitSpecializedDispatch(ClauseMatrix &clauses,
     return emitIsDispatch(rowsToSpecialize, arg, handler, failure);
   case PatternKind::EnumElement:
   case PatternKind::OptionalSome:
-    return emitEnumElementDispatch(rowsToSpecialize, arg, handler, failure);
+    return emitEnumElementDispatch(rowsToSpecialize, arg, handler, failure,
+                                   defaultCaseCount);
   case PatternKind::Bool:
     return emitBoolDispatch(rowsToSpecialize, arg, handler, failure);
   }
@@ -1380,12 +1431,14 @@ static ConsumableManagedValue
 getManagedSubobject(SILGenFunction &SGF, SILValue value,
                     const TypeLowering &valueTL,
                     CastConsumptionKind consumption) {
-  if (consumption != CastConsumptionKind::CopyOnSuccess) {
-    return {SGF.emitManagedRValueWithCleanup(value, valueTL),
-             consumption};
-  } else {
+  if (consumption == CastConsumptionKind::CopyOnSuccess) {
     return {ManagedValue::forUnmanaged(value), consumption};
   }
+
+  assert((!SGF.F.getModule().getOptions().EnableSILOwnership ||
+          consumption != CastConsumptionKind::TakeOnSuccess) &&
+         "TakeOnSuccess should never be used when sil ownership is enabled");
+  return {SGF.emitManagedRValueWithCleanup(value, valueTL), consumption};
 }
 
 static ConsumableManagedValue
@@ -1552,9 +1605,12 @@ emitCastOperand(SILGenFunction &SGF, SILLocation loc,
     // Okay, if all we need to do is drop the value in an address,
     // this is easy.
     if (!hasAbstraction) {
-      SGF.B.emitStoreValueOperation(
-          loc, src.getFinalManagedValue().forward(SGF), init->getAddress(),
-          StoreOwnershipQualifier::Init);
+      ManagedValue finalValue = src.getFinalManagedValue();
+      if (finalValue.getOwnershipKind() == ValueOwnershipKind::Guaranteed)
+        finalValue = finalValue.copy(SGF, loc);
+      SGF.B.emitStoreValueOperation(loc, finalValue.forward(SGF),
+                                    init->getAddress(),
+                                    StoreOwnershipQualifier::Init);
       init->finishInitialization(SGF);
       ConsumableManagedValue result =
         { init->getManagedAddress(), src.getFinalConsumption() };
@@ -1629,124 +1685,146 @@ void PatternMatchEmission::emitIsDispatch(ArrayRef<RowToSpecialize> rows,
         assert(!SGF.B.hasValidInsertionPoint() && "did not end block");
       },
       // Failure block: branch out to the continuation block.
-      [&] { (*innerFailure)(loc); });
+      [&] { (*innerFailure)(loc); }, rows[0].Count);
 }
 
-/// Perform specialized dispatch for a sequence of EnumElementPattern or an
-/// OptionalSomePattern.
-void PatternMatchEmission::emitEnumElementDispatchWithOwnership(
-    ArrayRef<RowToSpecialize> rows, ConsumableManagedValue src,
-    const SpecializationHandler &handleCase,
-    const FailureHandler &outerFailure) {
-  assert(src.getFinalConsumption() != CastConsumptionKind::TakeOnSuccess &&
-         "SIL ownership does not support TakeOnSuccess");
-
-  CanType sourceType = rows[0].Pattern->getType()->getCanonicalType();
-
+namespace {
   struct CaseInfo {
     EnumElementDecl *FormalElement;
     Pattern *FirstMatcher;
     bool Irrefutable = false;
     SmallVector<SpecializedRow, 2> SpecializedRows;
   };
+} // end anonymous namespace
 
-  SILBasicBlock *curBB = SGF.B.getInsertionBB();
+/// Create destination blocks for switching over the cases in an enum defined
+/// by \p rows.
+static void generateEnumCaseBlocks(
+    SILGenFunction &SGF,
+    ArrayRef<RowToSpecialize> rows,
+    CanType sourceType,
+    SILBasicBlock *curBB,
+    SmallVectorImpl<std::pair<EnumElementDecl *, SILBasicBlock *>> &caseBBs,
+    SmallVectorImpl<ProfileCounter> &caseCounts,
+    SmallVectorImpl<CaseInfo> &caseInfos,
+    SILBasicBlock *&defaultBB) {
+
+  assert(caseBBs.empty());
+  assert(caseCounts.empty());
+  assert(caseInfos.empty());
+  assert(defaultBB == nullptr);
+
+  caseBBs.reserve(rows.size());
+  caseInfos.reserve(rows.size());
+
+  auto enumDecl = sourceType.getEnumOrBoundGenericEnum();
+
+  llvm::SmallDenseMap<EnumElementDecl *, unsigned, 16> caseToIndex;
+  for (auto &row : rows) {
+    EnumElementDecl *formalElt;
+    Pattern *subPattern = nullptr;
+    if (auto eep = dyn_cast<EnumElementPattern>(row.Pattern)) {
+      formalElt = eep->getElementDecl();
+      subPattern = eep->getSubPattern();
+    } else {
+      auto *osp = cast<OptionalSomePattern>(row.Pattern);
+      formalElt = osp->getElementDecl();
+      subPattern = osp->getSubPattern();
+    }
+    assert(formalElt->getParentEnum() == enumDecl);
+
+    unsigned index = caseInfos.size();
+    auto insertionResult = caseToIndex.insert({formalElt, index});
+    if (!insertionResult.second) {
+      index = insertionResult.first->second;
+    } else {
+      curBB = SGF.createBasicBlock(curBB);
+      caseBBs.push_back({formalElt, curBB});
+      caseInfos.push_back(CaseInfo());
+      caseInfos.back().FormalElement = formalElt;
+      caseInfos.back().FirstMatcher = row.Pattern;
+      caseCounts.push_back(row.Count);
+    }
+    assert(caseToIndex[formalElt] == index);
+    assert(caseBBs[index].first == formalElt);
+
+    auto &info = caseInfos[index];
+    info.Irrefutable = (info.Irrefutable || row.Irrefutable);
+    info.SpecializedRows.push_back(SpecializedRow());
+    auto &specRow = info.SpecializedRows.back();
+    specRow.RowIndex = row.RowIndex;
+
+    // Use the row pattern, if it has one.
+    if (subPattern) {
+      specRow.Patterns.push_back(subPattern);
+      // It's also legal to write:
+      //   case .Some { ... }
+      // which is an implicit wildcard.
+    } else {
+      specRow.Patterns.push_back(nullptr);
+    }
+  }
+
+  assert(caseBBs.size() == caseInfos.size());
+
+  // Check to see if the enum may have values beyond the cases we can see
+  // at compile-time. This includes future cases (for resilient enums) and
+  // random values crammed into C enums.
+  //
+  // Note: This relies on the fact that there are no "non-resilient" enums that
+  // are still non-exhaustive, except for @objc enums.
+  bool canAssumeExhaustive = !enumDecl->isObjC();
+  if (canAssumeExhaustive) {
+    canAssumeExhaustive =
+        !enumDecl->isResilient(SGF.SGM.SwiftModule,
+                               SGF.F.getResilienceExpansion());
+  }
+  if (canAssumeExhaustive) {
+    // Check that Sema didn't let any cases slip through. (This can happen
+    // with @_downgrade_exhaustivity_check.)
+    canAssumeExhaustive = llvm::all_of(enumDecl->getAllElements(),
+                                       [&](const EnumElementDecl *elt) {
+      return caseToIndex.count(elt);
+    });
+  }
+
+  if (!canAssumeExhaustive)
+    defaultBB = SGF.createBasicBlock(curBB);
+}
+
+/// Perform specialized dispatch for a sequence of EnumElementPattern or an
+/// OptionalSomePattern.
+void PatternMatchEmission::emitEnumElementDispatchWithOwnership(
+    ArrayRef<RowToSpecialize> rows, ConsumableManagedValue src,
+    const SpecializationHandler &handleCase, const FailureHandler &outerFailure,
+    ProfileCounter defaultCastCount) {
+  assert(src.getFinalConsumption() != CastConsumptionKind::TakeOnSuccess &&
+         "SIL ownership does not support TakeOnSuccess");
+
+  CanType sourceType = rows[0].Pattern->getType()->getCanonicalType();
 
   // Collect the cases and specialized rows.
   //
   // These vectors are completely parallel, but the switch
   // instructions want only the first information, so we split them up.
   SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 4> caseBBs;
+  SmallVector<ProfileCounter, 4> caseCounts;
   SmallVector<CaseInfo, 4> caseInfos;
   SILBasicBlock *defaultBB = nullptr;
 
-  caseBBs.reserve(rows.size());
-  caseInfos.reserve(rows.size());
-
-  {
-    // Create destination blocks for all the cases.
-    llvm::DenseMap<EnumElementDecl *, unsigned> caseToIndex;
-    for (auto &row : rows) {
-      EnumElementDecl *formalElt;
-      Pattern *subPattern = nullptr;
-      if (auto eep = dyn_cast<EnumElementPattern>(row.Pattern)) {
-        formalElt = eep->getElementDecl();
-        subPattern = eep->getSubPattern();
-      } else {
-        auto *osp = cast<OptionalSomePattern>(row.Pattern);
-        formalElt = osp->getElementDecl();
-        subPattern = osp->getSubPattern();
-      }
-      auto elt = SGF.SGM.getLoweredEnumElementDecl(formalElt);
-
-      unsigned index = caseInfos.size();
-      auto insertionResult = caseToIndex.insert({elt, index});
-      if (!insertionResult.second) {
-        index = insertionResult.first->second;
-      } else {
-        curBB = SGF.createBasicBlock(curBB);
-        caseBBs.push_back({elt, curBB});
-        caseInfos.resize(caseInfos.size() + 1);
-        caseInfos.back().FormalElement = formalElt;
-        caseInfos.back().FirstMatcher = row.Pattern;
-      }
-      assert(caseToIndex[elt] == index);
-      assert(caseBBs[index].first == elt);
-
-      auto &info = caseInfos[index];
-      info.Irrefutable = (info.Irrefutable || row.Irrefutable);
-      info.SpecializedRows.resize(info.SpecializedRows.size() + 1);
-      auto &specRow = info.SpecializedRows.back();
-      specRow.RowIndex = row.RowIndex;
-
-      // Use the row pattern, if it has one.
-      if (subPattern) {
-        specRow.Patterns.push_back(subPattern);
-        // It's also legal to write:
-        //   case .Some { ... }
-        // which is an implicit wildcard.
-      } else {
-        specRow.Patterns.push_back(nullptr);
-      }
-    }
-
-    // We always need a default block if the enum is resilient.
-    // If the enum is @_fixed_layout, we only need one if the
-    // switch is not exhaustive.
-    bool exhaustive = false;
-    auto enumDecl = sourceType.getEnumOrBoundGenericEnum();
-
-    // The SIL values will range over Optional, so count against
-    // Optional's cases.
-    if (enumDecl == SGF.getASTContext().getImplicitlyUnwrappedOptionalDecl()) {
-      enumDecl = SGF.getASTContext().getOptionalDecl();
-    }
-
-    // FIXME: Get expansion from SILFunction
-    if (enumDecl->hasFixedLayout(SGF.SGM.M.getSwiftModule(),
-                                 ResilienceExpansion::Maximal)) {
-      exhaustive = true;
-
-      for (auto elt : enumDecl->getAllElements()) {
-        if (!caseToIndex.count(elt)) {
-          exhaustive = false;
-          break;
-        }
-      }
-    }
-
-    if (!exhaustive)
-      defaultBB = SGF.createBasicBlock(curBB);
-  }
-
-  assert(caseBBs.size() == caseInfos.size());
+  generateEnumCaseBlocks(SGF, rows, sourceType, SGF.B.getInsertionBB(),
+                         caseBBs, caseCounts, caseInfos, defaultBB);
 
   SILLocation loc = PatternMatchStmt;
   loc.setDebugLoc(rows[0].Pattern);
   // SEMANTIC SIL TODO: Once we have the representation of a switch_enum that
   // can take a +0 value, this extra copy should be a borrow.
   SILValue srcValue = src.getFinalManagedValue().copy(SGF, loc).forward(SGF);
-  SGF.B.createSwitchEnum(loc, srcValue, defaultBB, caseBBs);
+  // FIXME: Pass caseCounts in here as well, as it is in
+  // emitEnumElementDispatch.
+  ArrayRef<ProfileCounter> caseCountsArrayRef = caseCounts;
+  SGF.B.createSwitchEnum(loc, srcValue, defaultBB, caseBBs, caseCountsArrayRef,
+                         defaultCastCount);
 
   // Okay, now emit all the cases.
   for (unsigned i = 0, e = caseInfos.size(); i != e; ++i) {
@@ -1767,7 +1845,7 @@ void PatternMatchEmission::emitEnumElementDispatchWithOwnership(
 
     SILType eltTy;
     bool hasElt = false;
-    if (elt->getArgumentInterfaceType()) {
+    if (elt->hasAssociatedValues()) {
       eltTy = src.getType().getEnumElementType(elt, SGF.SGM.M);
       hasElt = !eltTy.getSwiftRValueType()->isVoid();
     }
@@ -1835,7 +1913,7 @@ void PatternMatchEmission::emitEnumElementDispatchWithOwnership(
               ->getCanonicalType();
 
       AbstractionPattern origEltTy =
-          (elt->getParentEnum()->classifyAsOptionalType()
+          (elt->getParentEnum()->isOptionalDecl()
                ? AbstractionPattern(substEltTy)
                : SGF.SGM.M.Types.getAbstractionPattern(elt));
 
@@ -1859,25 +1937,16 @@ void PatternMatchEmission::emitEnumElementDispatchWithOwnership(
 /// OptionalSomePattern.
 void PatternMatchEmission::emitEnumElementDispatch(
     ArrayRef<RowToSpecialize> rows, ConsumableManagedValue src,
-    const SpecializationHandler &handleCase,
-    const FailureHandler &outerFailure) {
+    const SpecializationHandler &handleCase, const FailureHandler &outerFailure,
+    ProfileCounter defaultCaseCount) {
   // If sil ownership is enabled and we have that our source type is an object,
   // use the dispatch code path.
   if (SGF.getOptions().EnableSILOwnership && src.getType().isObject()) {
     return emitEnumElementDispatchWithOwnership(rows, src, handleCase,
-                                                outerFailure);
+                                                outerFailure, defaultCaseCount);
   }
 
   CanType sourceType = rows[0].Pattern->getType()->getCanonicalType();
-
-  struct CaseInfo {
-    EnumElementDecl *FormalElement;
-    Pattern *FirstMatcher;
-    bool Irrefutable = false;
-    SmallVector<SpecializedRow, 2> SpecializedRows;
-  };
-
-  SILBasicBlock *curBB = SGF.B.getInsertionBB();
 
   // Collect the cases and specialized rows.
   //
@@ -1885,88 +1954,11 @@ void PatternMatchEmission::emitEnumElementDispatch(
   // instructions want only the first information, so we split them up.
   SmallVector<std::pair<EnumElementDecl*, SILBasicBlock*>, 4> caseBBs;
   SmallVector<CaseInfo, 4> caseInfos;
+  SmallVector<ProfileCounter, 4> caseCounts;
   SILBasicBlock *defaultBB = nullptr;
 
-  caseBBs.reserve(rows.size());
-  caseInfos.reserve(rows.size());
-
-  {
-    // Create destination blocks for all the cases.
-    llvm::DenseMap<EnumElementDecl*, unsigned> caseToIndex;
-    for (auto &row : rows) {    
-      EnumElementDecl *formalElt;
-      Pattern *subPattern = nullptr;
-      if (auto eep = dyn_cast<EnumElementPattern>(row.Pattern)) {
-        formalElt = eep->getElementDecl();
-        subPattern = eep->getSubPattern();
-      } else {
-        auto *osp = cast<OptionalSomePattern>(row.Pattern);
-        formalElt = osp->getElementDecl();
-        subPattern = osp->getSubPattern();
-      }
-      auto elt = SGF.SGM.getLoweredEnumElementDecl(formalElt);
-
-      unsigned index = caseInfos.size();
-      auto insertionResult = caseToIndex.insert({elt, index});
-      if (!insertionResult.second) {
-        index = insertionResult.first->second;
-      } else {
-        curBB = SGF.createBasicBlock(curBB);
-        caseBBs.push_back({elt, curBB});
-        caseInfos.resize(caseInfos.size() + 1);
-        caseInfos.back().FormalElement = formalElt;
-        caseInfos.back().FirstMatcher = row.Pattern;
-      }
-      assert(caseToIndex[elt] == index);
-      assert(caseBBs[index].first == elt);
-
-      auto &info = caseInfos[index];
-      info.Irrefutable = (info.Irrefutable || row.Irrefutable);
-      info.SpecializedRows.resize(info.SpecializedRows.size() + 1);
-      auto &specRow = info.SpecializedRows.back();
-      specRow.RowIndex = row.RowIndex;
-
-      // Use the row pattern, if it has one.
-      if (subPattern) {
-        specRow.Patterns.push_back(subPattern);
-      // It's also legal to write:
-      //   case .Some { ... }
-      // which is an implicit wildcard.
-      } else {
-        specRow.Patterns.push_back(nullptr);
-      }
-    }
-
-    // We always need a default block if the enum is resilient.
-    // If the enum is @_fixed_layout, we only need one if the
-    // switch is not exhaustive.
-    bool exhaustive = false;
-    auto enumDecl = sourceType.getEnumOrBoundGenericEnum();
-
-    // The SIL values will range over Optional, so count against
-    // Optional's cases.
-    if (enumDecl == SGF.getASTContext().getImplicitlyUnwrappedOptionalDecl()) {
-      enumDecl = SGF.getASTContext().getOptionalDecl();
-    }
-
-    // FIXME: Get expansion from SILFunction
-    if (enumDecl->hasFixedLayout(SGF.SGM.M.getSwiftModule(),
-                                 ResilienceExpansion::Maximal)) {
-      exhaustive = true;
-
-      for (auto elt : enumDecl->getAllElements()) {
-        if (!caseToIndex.count(elt)) {
-          exhaustive = false;
-          break;
-        }
-      }
-    }
-
-    if (!exhaustive)
-      defaultBB = SGF.createBasicBlock(curBB);
-  }
-
-  assert(caseBBs.size() == caseInfos.size());
+  generateEnumCaseBlocks(SGF, rows, sourceType, SGF.B.getInsertionBB(),
+                         caseBBs, caseCounts, caseInfos, defaultBB);
 
   // Emit the switch_enum{_addr} instruction.
   bool addressOnlyEnum = src.getType().isAddress();
@@ -2000,10 +1992,13 @@ void PatternMatchEmission::emitEnumElementDispatch(
   SILValue srcValue = src.getFinalManagedValue().forward(SGF);
   SILLocation loc = PatternMatchStmt;
   loc.setDebugLoc(rows[0].Pattern);
+  ArrayRef<ProfileCounter> caseCountsArrayRef = caseCounts;
   if (addressOnlyEnum) {
-    SGF.B.createSwitchEnumAddr(loc, srcValue, defaultBB, caseBBs);
+    SGF.B.createSwitchEnumAddr(loc, srcValue, defaultBB, caseBBs,
+                               caseCountsArrayRef, defaultCaseCount);
   } else {
-    SGF.B.createSwitchEnum(loc, srcValue, defaultBB, caseBBs);
+    SGF.B.createSwitchEnum(loc, srcValue, defaultBB, caseBBs,
+                           caseCountsArrayRef, defaultCaseCount);
   }
 
   // Okay, now emit all the cases.
@@ -2025,7 +2020,7 @@ void PatternMatchEmission::emitEnumElementDispatch(
 
     SILType eltTy;
     bool hasElt = false;
-    if (elt->getArgumentInterfaceType()) {
+    if (elt->hasAssociatedValues()) {
       eltTy = src.getType().getEnumElementType(elt, SGF.SGM.M);
       hasElt = !eltTy.getSwiftRValueType()->isVoid();
     }
@@ -2119,9 +2114,13 @@ void PatternMatchEmission::emitEnumElementDispatch(
         SILValue boxedValue = SGF.B.createProjectBox(loc, origCMV.getValue(), 0);
         eltTL = &SGF.getTypeLowering(boxedValue->getType());
         if (eltTL->isLoadable()) {
+          UnenforcedAccess access;
+          SILValue accessAddress =
+            access.beginAccess(SGF, loc, boxedValue, SILAccessKind::Read);
           ManagedValue newLoadedBoxValue = SGF.B.createLoadBorrow(
-              loc, ManagedValue::forUnmanaged(boxedValue));
+            loc, ManagedValue::forUnmanaged(accessAddress));
           boxedValue = newLoadedBoxValue.getUnmanagedValue();
+          access.endAccess(SGF);
         }
 
         // The boxed value may be shared, so we always have to copy it.
@@ -2137,9 +2136,9 @@ void PatternMatchEmission::emitEnumElementDispatch(
                   ->getCanonicalType();
 
       AbstractionPattern origEltTy =
-        (elt->getParentEnum()->classifyAsOptionalType()
-           ? AbstractionPattern(substEltTy)
-           : SGF.SGM.M.Types.getAbstractionPattern(elt));
+          (elt->getParentEnum()->isOptionalDecl()
+               ? AbstractionPattern(substEltTy)
+               : SGF.SGM.M.Types.getAbstractionPattern(elt));
 
       eltCMV = emitReabstractedSubobject(SGF, loc, eltCMV, *eltTL,
                                          origEltTy, substEltTy);
@@ -2274,40 +2273,100 @@ void PatternMatchEmission::emitCaseBody(CaseStmt *caseBlock) {
 
   // Implicitly break out of the pattern match statement.
   if (SGF.B.hasValidInsertionPoint()) {
-    SGF.emitBreakOutOf(CleanupLocation(caseBlock), PatternMatchStmt);
+    // Case blocks without trailing braces have ambiguous cleanup locations.
+    SILLocation cleanupLoc = RegularLocation::getAutoGeneratedLocation();
+    if (auto *braces = dyn_cast<BraceStmt>(caseBlock->getBody()))
+      if (braces->getNumElements() == 1 &&
+          dyn_cast_or_null<DoStmt>(braces->getElement(0).dyn_cast<Stmt *>()))
+        cleanupLoc = CleanupLocation(caseBlock);
+    SGF.emitBreakOutOf(cleanupLoc, PatternMatchStmt);
+  }
+}
+
+void PatternMatchEmission::initSharedCaseBlockDest(CaseStmt *caseBlock,
+                                                   bool hasFallthroughTo) {
+  auto result = SharedCases.insert({caseBlock, {nullptr, hasFallthroughTo}});
+  assert(result.second);
+
+  auto *block = SGF.createBasicBlock();
+  result.first->second.first = block;
+    
+  // Add args for any pattern variables
+  if (caseBlock->hasBoundDecls()) {
+    auto pattern = caseBlock->getCaseLabelItems()[0].getPattern();
+    pattern->forEachVariable([&](VarDecl *V) {
+      if (!V->hasName())
+        return;
+
+      // We don't pass address-only values in basic block arguments.
+      SILType ty = SGF.getLoweredType(V->getType());
+      if (ty.isAddressOnly(SGF.F.getModule()))
+        return;
+      block->createPHIArgument(ty, ValueOwnershipKind::Owned, V);
+    });
   }
 }
 
 /// Retrieve the jump destination for a shared case block.
-JumpDest PatternMatchEmission::getSharedCaseBlockDest(CaseStmt *caseBlock,
-                                                      bool hasFallthroughTo) {
-  auto result = SharedCases.insert({caseBlock, {nullptr, hasFallthroughTo}});
+JumpDest PatternMatchEmission::getSharedCaseBlockDest(CaseStmt *caseBlock) {
+  auto result = SharedCases.find(caseBlock);
+  assert(result != SharedCases.end());
 
-  // If there's already an entry, use that.
-  SILBasicBlock *block;
-  if (!result.second) {
-    block = result.first->second.first;
-    assert(block);
-  } else {
-    // Create the shared destination at the first place that might
-    // have needed it.
-    block = SGF.createBasicBlock();
-    result.first->second.first = block;
-    
-    // Add args for any pattern variables
+  auto *block = result->second.first;
+  assert(block);
+
+  return JumpDest(block, PatternMatchStmtDepth,
+                  CleanupLocation(PatternMatchStmt));
+}
+
+void PatternMatchEmission::emitAddressOnlyAllocations() {
+  for (auto &entry: SharedCases) {
+    CaseStmt *caseBlock = entry.first;
+
+    // If we have a shared case with bound decls, then the 0th pattern has the
+    // order of variables that are the incoming BB arguments. Setup the VarLocs
+    // to point to the incoming args and setup initialization so any args needing
+    // cleanup will get that as well.
     if (caseBlock->hasBoundDecls()) {
       auto pattern = caseBlock->getCaseLabelItems()[0].getPattern();
       pattern->forEachVariable([&](VarDecl *V) {
         if (!V->hasName())
           return;
-        block->createPHIArgument(SGF.getLoweredType(V->getType()),
-                                 ValueOwnershipKind::Owned, V);
+
+        SILType ty = SGF.getLoweredType(V->getType());
+        if (ty.isNull()) {
+          // If we're making the shared block on behalf of a previous case's
+          // fallthrough, caseBlock's VarDecl's won't be in the SGF yet, so
+          // determine phi types by using current vars of the same name.
+          for (auto var : SGF.VarLocs) {
+            auto varDecl = dyn_cast<VarDecl>(var.getFirst());
+            if (varDecl && varDecl->hasName() && varDecl->getName() == V->getName()) {
+              ty = var.getSecond().value->getType();
+              if (var.getSecond().box) {
+                ty = ty.getObjectType();
+              }
+            }
+          }
+        }
+        if (ty.isAddressOnly(SGF.F.getModule())) {
+          assert(!Temporaries[V]);
+          Temporaries[V] = SGF.emitTemporaryAllocation(V, ty);
+          return;
+        }
       });
     }
   }
 
-  return JumpDest(block, PatternMatchStmtDepth,
-                  CleanupLocation(PatternMatchStmt));
+  // Now we have all of our cleanups entered, so we can record the
+  // depth.
+  PatternMatchStmtDepth = SGF.getCleanupsDepth();
+}
+
+void PatternMatchEmission::
+emitAddressOnlyInitialization(VarDecl *dest, SILValue value) {
+  auto found = Temporaries.find(dest);
+  assert(found != Temporaries.end());
+  SGF.B.createCopyAddr(dest, value, found->second, IsNotTake, IsInitialization);
 }
 
 /// Emit all the shared case statements.
@@ -2333,8 +2392,13 @@ void PatternMatchEmission::emitSharedCaseBlocks() {
       SGF.B.setInsertionPoint(predBB);
       
     } else {
+      // FIXME: Figure out why this is necessary.
+      if (caseBB->pred_empty()) {
+        SGF.eraseBasicBlock(caseBB);
+        continue;
+      }
+
       // Otherwise, move the block to after the first predecessor.
-      assert(!caseBB->pred_empty() && "Emitted an unused shared block?");
       auto predBB = *caseBB->pred_begin();
       caseBB->moveAfter(predBB);
 
@@ -2343,7 +2407,7 @@ void PatternMatchEmission::emitSharedCaseBlocks() {
     }
     
     assert(SGF.getCleanupsDepth() == PatternMatchStmtDepth);
-    
+
     // If we have a shared case with bound decls, then the 0th pattern has the
     // order of variables that are the incoming BB arguments. Setup the VarLocs
     // to point to the incoming args and setup initialization so any args needing
@@ -2355,20 +2419,42 @@ void PatternMatchEmission::emitSharedCaseBlocks() {
       pattern->forEachVariable([&](VarDecl *V) {
         if (!V->hasName())
           return;
+
+        SILType ty = SGF.getLoweredType(V->getType());
+
+        // Initialize mv at +1. We always pass values in at +1 for today into
+        // shared blocks.
+        ManagedValue mv;
+        if (ty.isAddressOnly(SGF.F.getModule())) {
+          // There's no basic block argument, since we don't allow basic blocks
+          // to have address arguments.
+          //
+          // Instead, we map the variable to a temporary alloc_stack in
+          // emitAddressOnlyAllocations(), and store into it at each
+          // predecessor block.
+          //
+          // There's nothing to do here, since the value should already have
+          // been initialized on entry.
+          auto found = Temporaries.find(V);
+          assert(found != Temporaries.end());
+          mv = SGF.emitManagedRValueWithCleanup(found->second);
+        } else {
+          SILValue arg = caseBB->getArgument(argIndex++);
+          assert(arg.getOwnershipKind() == ValueOwnershipKind::Owned ||
+                 arg.getOwnershipKind() == ValueOwnershipKind::Trivial);
+          mv = SGF.emitManagedRValueWithCleanup(arg);
+        }
+
         if (V->isLet()) {
-          // Just emit a let with cleanup.
-          SGF.VarLocs[V].value = caseBB->getArgument(argIndex++);
-          SGF.emitInitializationForVarDecl(V)->finishInitialization(SGF);
+          // Just emit a let and leave the cleanup alone.
+          SGF.VarLocs[V].value = mv.getValue();
         } else {
           // The pattern variables were all emitted as lets and one got passed in,
           // now we finally alloc a box for the var and forward in the chosen value.
           SGF.VarLocs.erase(V);
-          auto newVar = SGF.emitInitializationForVarDecl(V);
-          auto loc = SGF.CurrentSILLoc;
-          auto value =
-              ManagedValue::forUnmanaged(caseBB->getArgument(argIndex++));
-          auto formalType = V->getType()->getCanonicalType();
-          RValue(SGF, loc, formalType, value).forwardInto(SGF, loc, newVar.get());
+          auto newVar = SGF.emitInitializationForVarDecl(V, V->isLet());
+          newVar->copyOrInitValueInto(SGF, V, mv, /*isInit*/ true);
+          newVar->finishInitialization(SGF);
         }
       });
       emitCaseBody(caseBlock);
@@ -2471,11 +2557,23 @@ void SILGenFunction::emitSwitchStmt(SwitchStmt *S) {
   DEBUG(llvm::dbgs() << "emitting switch stmt\n";
         S->print(llvm::dbgs());
         llvm::dbgs() << '\n');
-  SILBasicBlock *contBB = createBasicBlock();
-  emitProfilerIncrement(S);
-  JumpDest contDest(contBB, Cleanups.getCleanupsDepth(), CleanupLocation(S));
+  auto failure = [this](SILLocation location) {
+    // If we fail to match anything, we trap. This can happen with a switch
+    // over an @objc enum, which may contain any value of its underlying type.
+    // FIXME: Even if we can't say what the invalid value was, we should at
+    // least mention that this was because of a non-exhaustive enum.
+    B.createBuiltinTrap(location);
+    B.createUnreachable(location);
+  };
+  
+  // If the subject expression is uninhabited, we're already dead.
+  // Emit an unreachable in place of the switch statement.
+  if (S->getSubjectExpr()->getType()->isStructurallyUninhabited()) {
+    emitIgnoredExpr(S->getSubjectExpr());
+    B.createUnreachable(S);
+    return;
+  }
 
- 
   auto completionHandler = [&](PatternMatchEmission &emission,
                                ArgArray argArray,
                                ClauseRow &row) {
@@ -2488,37 +2586,57 @@ void SILGenFunction::emitSwitchStmt(SwitchStmt *S) {
     if (!caseBlock->hasBoundDecls()) {
       // Don't emit anything yet, we emit it at the cleanup level of the switch
       // statement.
-      JumpDest sharedDest = emission.getSharedCaseBlockDest(caseBlock,
-                                                        row.hasFallthroughTo());
+      JumpDest sharedDest = emission.getSharedCaseBlockDest(caseBlock);
       Cleanups.emitBranchAndCleanups(sharedDest, caseBlock);
-    } else if (caseBlock->getCaseLabelItems().size() > 1) {
-      JumpDest sharedDest = emission.getSharedCaseBlockDest(caseBlock,
-                                                            row.hasFallthroughTo());
-      
-      // Generate the arguments from this row's pattern in the case block's expected order,
-      // and keep those arguments from being cleaned up, as we're passing the +1 along to
-      // the shared case block dest. (The cleanups still happen, as they are threaded through
-      // here messily, but the explicit retains here counteract them, and then the
+    } else if (row.hasFallthroughTo() || caseBlock->getCaseLabelItems().size() > 1) {
+      JumpDest sharedDest =
+          emission.getSharedCaseBlockDest(caseBlock);
+
+      // Generate the arguments from this row's pattern in the case block's
+      // expected order, and keep those arguments from being cleaned up, as
+      // we're passing the +1 along to the shared case block dest. (The
+      // cleanups still happen, as they are threaded through here messily,
+      // but the explicit retains here counteract them, and then the
       // retain/release pair gets optimized out.)
       ArrayRef<CaseLabelItem> labelItems = caseBlock->getCaseLabelItems();
       SmallVector<SILValue, 4> args;
       SmallVector<VarDecl *, 4> expectedVarOrder;
-      SmallVector<VarDecl *, 4> Vars;
+      SmallVector<VarDecl *, 4> vars;
       labelItems[0].getPattern()->collectVariables(expectedVarOrder);
-      row.getCasePattern()->collectVariables(Vars);
-      
+      row.getCasePattern()->collectVariables(vars);
+
+      SILModule &M = F.getModule();
       for (auto expected : expectedVarOrder) {
         if (!expected->hasName())
-        continue;
-        for (auto var : Vars) {
+          continue;
+        for (auto *var : vars) {
           if (var->hasName() && var->getName() == expected->getName()) {
-            auto value = B.emitCopyValueOperation(CurrentSILLoc,
-                                                  VarLocs[var].value);
+            SILValue value = VarLocs[var].value;
+            SILType type = value->getType();
+
+            // If we have an address-only type, initialize the temporary
+            // allocation. We're not going to pass the address as a block
+            // argument.
+            if (type.isAddressOnly(M)) {
+              emission.emitAddressOnlyInitialization(expected, value);
+              break;
+            }
+
+            // If we have a loadable address, perform a load [copy].
+            if (type.isAddress()) {
+              value = B.emitLoadValueOperation(CurrentSILLoc, value,
+                                               LoadOwnershipQualifier::Copy);
+              args.push_back(value);
+              break;
+            }
+
+            value = B.emitCopyValueOperation(CurrentSILLoc, value);
             args.push_back(value);
             break;
           }
         }
       }
+
       Cleanups.emitBranchAndCleanups(sharedDest, caseBlock, args);
     } else {
       // However, if we don't have a fallthrough or a multi-pattern 'case', we
@@ -2529,7 +2647,39 @@ void SILGenFunction::emitSwitchStmt(SwitchStmt *S) {
   };
 
   PatternMatchEmission emission(*this, S, completionHandler);
-  
+
+  // Add a row for each label of each case.
+  //
+  // We use std::vector because it supports emplace_back; moving a ClauseRow is
+  // expensive.
+  std::vector<ClauseRow> clauseRows;
+  clauseRows.reserve(S->getRawCases().size());
+  bool hasFallthrough = false;
+  for (auto caseBlock : S->getCases()) {
+    if (!caseBlock->hasBoundDecls() ||
+        caseBlock->getCaseLabelItems().size() > 1 ||
+        hasFallthrough) {
+      emission.initSharedCaseBlockDest(caseBlock, hasFallthrough);
+    }
+
+    for (auto &labelItem : caseBlock->getCaseLabelItems()) {
+      clauseRows.emplace_back(caseBlock,
+                              const_cast<Pattern*>(labelItem.getPattern()),
+                              const_cast<Expr*>(labelItem.getGuardExpr()),
+                              hasFallthrough);
+    }
+    
+    hasFallthrough = containsFallthrough(caseBlock->getBody());
+  }
+
+  // Emit alloc_stacks for address-only variables appearing in
+  // multiple-entry case blocks.
+  emission.emitAddressOnlyAllocations();
+
+  SILBasicBlock *contBB = createBasicBlock();
+  emitProfilerIncrement(S);
+  JumpDest contDest(contBB, Cleanups.getCleanupsDepth(), CleanupLocation(S));
+
   Scope switchScope(Cleanups, CleanupLocation(S));
 
   // Enter a break/continue scope.  If we wanted a continue
@@ -2543,31 +2693,8 @@ void SILGenFunction::emitSwitchStmt(SwitchStmt *S) {
   ManagedValue subjectMV = emitRValueAsSingleValue(S->getSubjectExpr());
   auto subject = ConsumableManagedValue::forOwned(subjectMV);
 
-  // Add a row for each label of each case.
-  // We use std::vector because it supports emplace_back; moving
-  // a ClauseRow is expensive.
-  std::vector<ClauseRow> clauseRows;
-  clauseRows.reserve(S->getCases().size());
-  bool hasFallthrough = false;
-  for (auto caseBlock : S->getCases()) {
-    for (auto &labelItem : caseBlock->getCaseLabelItems()) {
-      clauseRows.emplace_back(caseBlock,
-                              const_cast<Pattern*>(labelItem.getPattern()),
-                              const_cast<Expr*>(labelItem.getGuardExpr()),
-                              hasFallthrough);
-    }
-    
-    hasFallthrough = containsFallthrough(caseBlock->getBody());
-  }
-
   // Set up an initial clause matrix.
   ClauseMatrix clauses(clauseRows);
-
-  auto failure = [&](SILLocation location) {
-    // If we fail to match anything, we can just emit unreachable.
-    // This will be a dataflow error if we can reach here.
-    B.createUnreachable(S);
-  };
 
   // Recursively specialize and emit the clause matrix.
   emission.emitDispatch(clauses, subject, failure);
@@ -2575,7 +2702,7 @@ void SILGenFunction::emitSwitchStmt(SwitchStmt *S) {
 
   switchScope.pop();
 
-  // Emit any shared case blocks we generated.
+  // Then emit the case blocks shared by multiple pattern cases.
   emission.emitSharedCaseBlocks();
 
   // Bookkeeping.
@@ -2598,8 +2725,42 @@ void SILGenFunction::emitSwitchFallthrough(FallthroughStmt *S) {
   // Get the destination block.
   CaseStmt *caseStmt = S->getFallthroughDest();
   JumpDest sharedDest =
-    context->Emission.getSharedCaseBlockDest(caseStmt, true);
-  Cleanups.emitBranchAndCleanups(sharedDest, S);
+  context->Emission.getSharedCaseBlockDest(caseStmt);
+
+  if (!caseStmt->hasBoundDecls()) {
+    Cleanups.emitBranchAndCleanups(sharedDest, S);
+  } else {
+    // Generate branch args to pass along current vars to fallthrough case.
+    SILModule &M = F.getModule();
+    ArrayRef<CaseLabelItem> labelItems = caseStmt->getCaseLabelItems();
+    SmallVector<SILValue, 4> args;
+    SmallVector<VarDecl *, 4> expectedVarOrder;
+    labelItems[0].getPattern()->collectVariables(expectedVarOrder);
+    
+    for (auto *expected : expectedVarOrder) {
+      if (!expected->hasName())
+        continue;
+      for (auto var : VarLocs) {
+        auto varDecl = dyn_cast<VarDecl>(var.getFirst());
+        if (varDecl && varDecl->hasName() && varDecl->getName() == expected->getName()) {
+          SILValue value = var.getSecond().value;
+
+          if (value->getType().isAddressOnly(M)) {
+            context->Emission.emitAddressOnlyInitialization(expected, value);
+          } else if (var.getSecond().box) {
+            auto &lowering = getTypeLowering(value->getType());
+            auto argValue = lowering.emitLoad(B, CurrentSILLoc, value, LoadOwnershipQualifier::Copy);
+            args.push_back(argValue);
+          } else {
+            auto argValue = B.emitCopyValueOperation(CurrentSILLoc, value);
+            args.push_back(argValue);
+          }
+          break;
+        }
+      }
+    }
+    Cleanups.emitBranchAndCleanups(sharedDest, S, args);
+  }
 }
 
 

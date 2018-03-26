@@ -167,7 +167,7 @@ var ir2 = ((&i)) // expected-error{{variable has type 'inout Int' which includes
 func takeArrayRef(_ x: inout Array<String>) { }
 
 // rdar://22308291
-takeArrayRef(["asdf", "1234"]) // expected-error{{contextual type 'inout Array<String>' cannot be used with array literal}}
+takeArrayRef(["asdf", "1234"]) // expected-error{{cannot pass immutable value of type '[String]' as inout argument}}
 
 // <rdar://problem/19835413> Reference to value from array changed
 func rdar19835413() {
@@ -232,3 +232,13 @@ func r23331567(_ fn: (_ x: inout Int) -> Void) {
 }
 r23331567 { $0 += 1 }
 
+// <rdar://problem/30685195> Compiler crash with invalid assignment
+struct G<T> {
+  subscript(x: Int) -> T { get { } nonmutating set { } }
+  // expected-note@-1 {{'subscript' declared here}}
+}
+
+func wump<T>(to: T, _ body: (G<T>) -> ()) {}
+
+wump(to: 0, { $0[] = 0 })
+// expected-error@-1 {{missing argument for parameter #1 in call}}

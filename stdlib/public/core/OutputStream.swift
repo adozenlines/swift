@@ -75,7 +75,9 @@ public protocol TextOutputStream {
 }
 
 extension TextOutputStream {
+  @_inlineable // FIXME(sil-serialize-all)
   public mutating func _lock() {}
+  @_inlineable // FIXME(sil-serialize-all)
   public mutating func _unlock() {}
 }
 
@@ -84,7 +86,7 @@ extension TextOutputStream {
 /// Instances of types that conform to the `TextOutputStreamable` protocol can
 /// write their value to instances of any type that conforms to the
 /// `TextOutputStream` protocol. The Swift standard library's text-related
-/// types, `String`, `Character`, and `UnicodeScalar`, all conform to
+/// types, `String`, `Character`, and `Unicode.Scalar`, all conform to
 /// `TextOutputStreamable`.
 ///
 /// Conforming to the TextOutputStreamable Protocol
@@ -98,9 +100,6 @@ public protocol TextOutputStreamable {
   /// stream.
   func write<Target : TextOutputStream>(to target: inout Target)
 }
-
-@available(*, unavailable, renamed: "TextOutputStreamable")
-typealias Streamable = TextOutputStreamable
 
 /// A type with a customized textual representation.
 ///
@@ -144,14 +143,14 @@ typealias Streamable = TextOutputStreamable
 ///
 ///     print(p)
 ///     // Prints "(21, 30)"
-///
-/// - SeeAlso: `String.init<T>(T)`, `CustomDebugStringConvertible`
 public protocol CustomStringConvertible {
   /// A textual representation of this instance.
   ///
-  /// Instead of accessing this property directly, convert an instance of any
-  /// type to a string by using the `String(describing:)` initializer. For
-  /// example:
+  /// Calling this property directly is discouraged. Instead, convert an
+  /// instance of any type to a string by using the `String(describing:)`
+  /// initializer. This initializer works with any type, and uses the custom
+  /// `description` property for types that conform to
+  /// `CustomStringConvertible`:
   ///
   ///     struct Point: CustomStringConvertible {
   ///         let x: Int, y: Int
@@ -200,6 +199,13 @@ public protocol LosslessStringConvertible : CustomStringConvertible {
 /// `debugDescription` property directly or using
 /// `CustomDebugStringConvertible` as a generic constraint is discouraged.
 ///
+/// - Note: Calling the `dump(_:_:_:_:)` function and printing in the debugger
+///   uses both `String(reflecting:)` and `Mirror(reflecting:)` to collect
+///   information about an instance. If you implement
+///   `CustomDebugStringConvertible` conformance for your custom type, you may
+///   want to consider providing a custom mirror by implementing
+///   `CustomReflectable` conformance, as well.
+///
 /// Conforming to the CustomDebugStringConvertible Protocol
 /// =======================================================
 ///
@@ -232,10 +238,30 @@ public protocol LosslessStringConvertible : CustomStringConvertible {
 ///
 ///     print(String(reflecting: p))
 ///     // Prints "Point(x: 21, y: 30)"
-///
-/// - SeeAlso: `String.init<T>(reflecting: T)`, `CustomStringConvertible`
 public protocol CustomDebugStringConvertible {
   /// A textual representation of this instance, suitable for debugging.
+  ///
+  /// Calling this property directly is discouraged. Instead, convert an
+  /// instance of any type to a string by using the `String(reflecting:)`
+  /// initializer. This initializer works with any type, and uses the custom
+  /// `debugDescription` property for types that conform to
+  /// `CustomDebugStringConvertible`:
+  ///
+  ///     struct Point: CustomDebugStringConvertible {
+  ///         let x: Int, y: Int
+  ///
+  ///         var debugDescription: String {
+  ///             return "(\(x), \(y))"
+  ///         }
+  ///     }
+  ///
+  ///     let p = Point(x: 21, y: 30)
+  ///     let s = String(reflecting: p)
+  ///     print(s)
+  ///     // Prints "(21, 30)"
+  ///
+  /// The conversion of `p` to a string in the assignment to `s` uses the
+  /// `Point` type's `debugDescription` property.
   var debugDescription: String { get }
 }
 
@@ -243,13 +269,17 @@ public protocol CustomDebugStringConvertible {
 // Default (ad-hoc) printing
 //===----------------------------------------------------------------------===//
 
+@_versioned // FIXME(sil-serialize-all)
 @_silgen_name("swift_EnumCaseName")
-func _getEnumCaseName<T>(_ value: T) -> UnsafePointer<CChar>?
+internal func _getEnumCaseName<T>(_ value: T) -> UnsafePointer<CChar>?
 
+@_versioned // FIXME(sil-serialize-all)
 @_silgen_name("swift_OpaqueSummary")
-func _opaqueSummary(_ metadata: Any.Type) -> UnsafePointer<CChar>?
+internal func _opaqueSummary(_ metadata: Any.Type) -> UnsafePointer<CChar>?
 
 /// Do our best to print a value that cannot be printed directly.
+@_inlineable // FIXME(sil-serialize-all)
+@_versioned // FIXME(sil-serialize-all)
 @_semantics("optimize.sil.specialize.generic.never")
 internal func _adHocPrint_unlocked<T, TargetStream : TextOutputStream>(
     _ value: T, _ mirror: Mirror, _ target: inout TargetStream,
@@ -347,7 +377,6 @@ internal func _adHocPrint_unlocked<T, TargetStream : TextOutputStream>(
 @_versioned
 @inline(never)
 @_semantics("optimize.sil.specialize.generic.never")
-@_semantics("stdlib_binary_only")
 internal func _print_unlocked<T, TargetStream : TextOutputStream>(
   _ value: T, _ target: inout TargetStream
 ) {
@@ -390,7 +419,9 @@ internal func _print_unlocked<T, TargetStream : TextOutputStream>(
 @_inlineable
 @_versioned
 @inline(never) @effects(readonly)
-func _toStringReadOnlyStreamable<T : TextOutputStreamable>(_ x: T) -> String {
+internal func _toStringReadOnlyStreamable<
+  T : TextOutputStreamable
+>(_ x: T) -> String {
   var result = ""
   x.write(to: &result)
   return result
@@ -399,7 +430,9 @@ func _toStringReadOnlyStreamable<T : TextOutputStreamable>(_ x: T) -> String {
 @_inlineable
 @_versioned
 @inline(never) @effects(readonly)
-func _toStringReadOnlyPrintable<T : CustomStringConvertible>(_ x: T) -> String {
+internal func _toStringReadOnlyPrintable<
+  T : CustomStringConvertible
+>(_ x: T) -> String {
   return x.description
 }
 
@@ -407,6 +440,7 @@ func _toStringReadOnlyPrintable<T : CustomStringConvertible>(_ x: T) -> String {
 // `debugPrint`
 //===----------------------------------------------------------------------===//
 
+@_inlineable // FIXME(sil-serialize-all)
 @_semantics("optimize.sil.specialize.generic.never")
 @inline(never)
 public func _debugPrint_unlocked<T, TargetStream : TextOutputStream>(
@@ -431,6 +465,8 @@ public func _debugPrint_unlocked<T, TargetStream : TextOutputStream>(
   _adHocPrint_unlocked(value, mirror, &target, isDebugPrint: true)
 }
 
+@_inlineable // FIXME(sil-serialize-all)
+@_versioned // FIXME(sil-serialize-all)
 @_semantics("optimize.sil.specialize.generic.never")
 internal func _dumpPrint_unlocked<T, TargetStream : TextOutputStream>(
     _ value: T, _ mirror: Mirror, _ target: inout TargetStream
@@ -502,30 +538,39 @@ internal func _dumpPrint_unlocked<T, TargetStream : TextOutputStream>(
 // OutputStreams
 //===----------------------------------------------------------------------===//
 
+@_fixed_layout // FIXME(sil-serialize-all)
+@_versioned // FIXME(sil-serialize-all)
 internal struct _Stdout : TextOutputStream {
-  mutating func _lock() {
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal init() {}
+
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal mutating func _lock() {
     _swift_stdlib_flockfile_stdout()
   }
 
-  mutating func _unlock() {
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal mutating func _unlock() {
     _swift_stdlib_funlockfile_stdout()
   }
 
-  mutating func write(_ string: String) {
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal mutating func write(_ string: String) {
     if string.isEmpty { return }
 
-    if let asciiBuffer = string._core.asciiBuffer {
+    if _fastPath(string._guts.isASCII) {
       defer { _fixLifetime(string) }
-
-      _swift_stdlib_fwrite_stdout(
-        UnsafePointer(asciiBuffer.baseAddress!),
-        asciiBuffer.count,
-        1)
+      let ascii = string._guts._unmanagedASCIIView
+      _stdlib_fwrite_stdout(ascii.start, ascii.count, 1)
       return
     }
 
     for c in string.utf8 {
-      _swift_stdlib_putchar_unlocked(Int32(c))
+      _stdlib_putchar_unlocked(Int32(c))
     }
   }
 }
@@ -534,6 +579,7 @@ extension String : TextOutputStream {
   /// Appends the given string to this string.
   /// 
   /// - Parameter other: A string to append.
+  @_inlineable // FIXME(sil-serialize-all)
   public mutating func write(_ other: String) {
     self += other
   }
@@ -547,6 +593,7 @@ extension String : TextOutputStreamable {
   /// Writes the string into the given output stream.
   /// 
   /// - Parameter target: An output stream.
+  @_inlineable // FIXME(sil-serialize-all)
   public func write<Target : TextOutputStream>(to target: inout Target) {
     target.write(self)
   }
@@ -556,37 +603,58 @@ extension Character : TextOutputStreamable {
   /// Writes the character into the given output stream.
   ///
   /// - Parameter target: An output stream.
+  @_inlineable // FIXME(sil-serialize-all)
   public func write<Target : TextOutputStream>(to target: inout Target) {
     target.write(String(self))
   }
 }
 
-extension UnicodeScalar : TextOutputStreamable {
+extension Unicode.Scalar : TextOutputStreamable {
   /// Writes the textual representation of the Unicode scalar into the given
   /// output stream.
   ///
   /// - Parameter target: An output stream.
+  @_inlineable // FIXME(sil-serialize-all)
   public func write<Target : TextOutputStream>(to target: inout Target) {
     target.write(String(Character(self)))
   }
 }
 
 /// A hook for playgrounds to print through.
-public var _playgroundPrintHook : ((String) -> Void)? = {_ in () }
+public var _playgroundPrintHook : ((String) -> Void)? = nil
 
+@_fixed_layout // FIXME(sil-serialize-all)
+@_versioned // FIXME(sil-serialize-all)
 internal struct _TeeStream<
   L : TextOutputStream,
   R : TextOutputStream
 > : TextOutputStream {
-  var left: L
-  var right: R
+
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal init(left: L, right: R) {
+    self.left = left
+    self.right = right
+  }
+
+  @_versioned // FIXME(sil-serialize-all)
+  internal var left: L
+  @_versioned // FIXME(sil-serialize-all)
+  internal var right: R
   
   /// Append the given `string` to this stream.
-  mutating func write(_ string: String)
-  { left.write(string); right.write(string) }
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal mutating func write(_ string: String) {
+    left.write(string); right.write(string)
+  }
 
-  mutating func _lock() { left._lock(); right._lock() }
-  mutating func _unlock() { right._unlock(); left._unlock() }
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal mutating func _lock() { left._lock(); right._lock() }
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal mutating func _unlock() { right._unlock(); left._unlock() }
 }
 
 @available(*, unavailable, renamed: "TextOutputStream")

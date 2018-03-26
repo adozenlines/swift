@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -17,11 +17,13 @@
 #ifndef SWIFT_DRIVER_COMPILATION_H
 #define SWIFT_DRIVER_COMPILATION_H
 
-#include "swift/Driver/Job.h"
-#include "swift/Driver/Util.h"
 #include "swift/Basic/ArrayRefView.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Statistic.h"
+#include "swift/Driver/Driver.h"
+#include "swift/Driver/Job.h"
+#include "swift/Driver/Util.h"
+#include "swift/Frontend/OutputFileMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Chrono.h"
@@ -42,6 +44,7 @@ namespace swift {
 namespace driver {
   class Driver;
   class ToolChain;
+  class OutputInfo;
   class PerformJobsState;
 
 /// An enum providing different levels of output which should be produced
@@ -49,6 +52,9 @@ namespace driver {
 enum class OutputLevel {
   /// Indicates that normal output should be produced.
   Normal,
+  
+  /// Indicates that only jobs should be printed and not run. (-###)
+  PrintJobs,
 
   /// Indicates that verbose output should be produced. (-v)
   Verbose,
@@ -57,14 +63,40 @@ enum class OutputLevel {
   Parseable,
 };
 
+/// Indicates whether a temporary file should always be preserved if a part of
+/// the compilation crashes.
+enum class PreserveOnSignal : bool {
+  No,
+  Yes
+};
+
 class Compilation {
   friend class PerformJobsState;
 private:
   /// The DiagnosticEngine to which this Compilation should emit diagnostics.
   DiagnosticEngine &Diags;
 
+  /// The ToolChain this Compilation was built with, that it may reuse to build
+  /// subsequent BatchJobs.
+  const ToolChain &TheToolChain;
+
+  /// The OutputInfo, which the Compilation stores a copy of upon
+  /// construction, and which it may use to build subsequent batch
+  /// jobs itself.
+  OutputInfo TheOutputInfo;
+
   /// The OutputLevel at which this Compilation should generate output.
   OutputLevel Level;
+
+  /// The OutputFileMap describing the Compilation's outputs, populated both by
+  /// the user-provided output file map (if it exists) and inference rules that
+  /// derive otherwise-unspecified output filenames from context.
+  OutputFileMap DerivedOutputFileMap;
+
+  /// The Actions which were used to build the Jobs.
+  ///
+  /// This is mostly only here for lifetime management.
+  SmallVector<std::unique_ptr<const Action>, 32> Actions;
 
   /// The Jobs which will be performed by this compilation.
   SmallVector<std::unique_ptr<const Job>, 32> Jobs;
@@ -87,8 +119,8 @@ private:
 
   /// Temporary files that should be cleaned up after the compilation finishes.
   ///
-  /// These apply whether the compilation succeeds or fails.
-  std::vector<std::string> TempFilePaths;
+  /// These apply whether the compilation succeeds or fails. If the
+  llvm::StringMap<PreserveOnSignal> TempFilePaths;
 
   /// Write information about this compilation to this file.
   ///
@@ -128,6 +160,19 @@ private:
   /// of date.
   bool EnableIncrementalBuild;
 
+  /// Indicates whether groups of parallel frontend jobs should be merged
+  /// together and run in composite "batch jobs" when possible, to reduce
+  /// redundant work.
+  bool EnableBatchMode;
+
+  /// Provides a randomization seed to batch-mode partitioning, for debugging.
+  unsigned BatchSeed;
+
+  /// In order to test repartitioning, set to true if
+  /// -driver-force-one-batch-repartition is present. This is cleared after the
+  /// forced repartition happens.
+  bool ForceOneBatchRepartition = false;
+
   /// True if temporary files should not be deleted.
   bool SaveTemps;
 
@@ -150,42 +195,74 @@ private:
   /// -emit-loaded-module-trace, so no other job needs to do it.
   bool PassedEmitLoadedModuleTraceToFrontendJob = false;
 
-  static const Job *unwrap(const std::unique_ptr<const Job> &p) {
+  template <typename T>
+  static T *unwrap(const std::unique_ptr<T> &p) {
     return p.get();
   }
-  
+
+  template <typename T>
+  using UnwrappedArrayView =
+      ArrayRefView<std::unique_ptr<T>, T *, Compilation::unwrap<T>>;
+
 public:
-  Compilation(DiagnosticEngine &Diags, OutputLevel Level,
+  Compilation(DiagnosticEngine &Diags, const ToolChain &TC,
+              OutputInfo const &OI,
+              OutputLevel Level,
               std::unique_ptr<llvm::opt::InputArgList> InputArgs,
               std::unique_ptr<llvm::opt::DerivedArgList> TranslatedArgs,
               InputFileList InputsWithTypes,
               StringRef ArgsHash, llvm::sys::TimePoint<> StartTime,
               unsigned NumberOfParallelCommands = 1,
               bool EnableIncrementalBuild = false,
+              bool EnableBatchMode = false,
+              unsigned BatchSeed = 0,
+              bool ForceOneBatchRepartition = false,
               bool SkipTaskExecution = false,
               bool SaveTemps = false,
               bool ShowDriverTimeCompilation = false,
               std::unique_ptr<UnifiedStatsReporter> Stats = nullptr);
   ~Compilation();
 
-  ArrayRefView<std::unique_ptr<const Job>, const Job *, Compilation::unwrap>
-  getJobs() const {
+  ToolChain const &getToolChain() const {
+    return TheToolChain;
+  }
+
+  OutputInfo const &getOutputInfo() const {
+    return TheOutputInfo;
+  }
+
+  UnwrappedArrayView<const Action> getActions() const {
+    return llvm::makeArrayRef(Actions);
+  }
+
+  template <typename SpecificAction, typename... Args>
+  SpecificAction *createAction(Args &&...args) {
+    auto newAction = new SpecificAction(std::forward<Args>(args)...);
+    Actions.emplace_back(newAction);
+    return newAction;
+  }
+
+  UnwrappedArrayView<const Job> getJobs() const {
     return llvm::makeArrayRef(Jobs);
   }
   Job *addJob(std::unique_ptr<Job> J);
 
-  void addTemporaryFile(StringRef file) {
-    TempFilePaths.push_back(file.str());
+  void addTemporaryFile(StringRef file,
+                        PreserveOnSignal preserve = PreserveOnSignal::No) {
+    TempFilePaths[file] = preserve;
   }
 
   bool isTemporaryFile(StringRef file) {
-    // TODO: Use a set instead of a linear search.
-    return std::find(TempFilePaths.begin(), TempFilePaths.end(), file) !=
-             TempFilePaths.end();
+    return TempFilePaths.count(file);
   }
 
   const llvm::opt::DerivedArgList &getArgs() const { return *TranslatedArgs; }
   ArrayRef<InputPair> getInputFiles() const { return InputFilesWithTypes; }
+
+  OutputFileMap &getDerivedOutputFileMap() { return DerivedOutputFileMap; }
+  const OutputFileMap &getDerivedOutputFileMap() const {
+    return DerivedOutputFileMap;
+  }
 
   unsigned getNumberOfParallelCommands() const {
     return NumberOfParallelCommands;
@@ -197,7 +274,13 @@ public:
   void disableIncrementalBuild() {
     EnableIncrementalBuild = false;
   }
-  
+
+  bool getBatchModeEnabled() const {
+    return EnableBatchMode;
+  }
+
+  bool getForceOneBatchRepartition() const { return ForceOneBatchRepartition; }
+
   bool getContinueBuildingAfterErrors() const {
     return ContinueBuildingAfterErrors;
   }
@@ -255,9 +338,12 @@ public:
 private:
   /// \brief Perform all jobs.
   ///
-  /// \returns exit code of the first failed Job, or 0 on success. A return
-  /// value of -2 indicates that a Job crashed during execution.
-  int performJobsImpl();
+  /// \param[out] abnormalExit Set to true if any job exits abnormally (i.e.
+  /// crashes).
+  ///
+  /// \returns exit code of the first failed Job, or 0 on success. If a Job
+  /// crashes during execution, a negative value will be returned.
+  int performJobsImpl(bool &abnormalExit);
 
   /// \brief Performs a single Job by executing in place, if possible.
   ///

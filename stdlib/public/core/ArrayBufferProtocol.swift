@@ -16,16 +16,15 @@
 internal protocol _ArrayBufferProtocol
   : MutableCollection, RandomAccessCollection {
 
-  associatedtype Indices : RandomAccessCollection = CountableRange<Int>
-
-  /// The type of elements stored in the buffer.
-  associatedtype Element
+  associatedtype Indices = Range<Int>
 
   /// Create an empty buffer.
   init()
 
   /// Adopt the entire buffer, presenting it at the provided `startIndex`.
   init(_buffer: _ContiguousArrayBuffer<Element>, shiftedToStartIndex: Int)
+
+  init(copying buffer: Self)
 
   /// Copy the elements in `bounds` from this buffer into uninitialized
   /// memory starting at `target`.  Return a pointer "past the end" of the
@@ -76,7 +75,7 @@ internal protocol _ArrayBufferProtocol
     _ subrange: Range<Int>,
     with newCount: Int,
     elementsOf newValues: C
-  ) where C : Collection, C.Iterator.Element == Element
+  ) where C : Collection, C.Element == Element
 
   /// Returns a `_SliceBuffer` containing the elements in `bounds`.
   subscript(bounds: Range<Int>) -> _SliceBuffer<Element> { get }
@@ -127,12 +126,25 @@ internal protocol _ArrayBufferProtocol
   var endIndex: Int { get }
 }
 
-extension _ArrayBufferProtocol {
+extension _ArrayBufferProtocol where Indices == Range<Int>{
 
   @_inlineable
   @_versioned
   internal var subscriptBaseAddress: UnsafeMutablePointer<Element> {
     return firstElementAddress
+  }
+
+  // Make sure the compiler does not inline _copyBuffer to reduce code size.
+  @_inlineable
+  @inline(never)
+  @_versioned
+  internal init(copying buffer: Self) {
+    let newBuffer = _ContiguousArrayBuffer<Element>(
+      _uninitializedCount: buffer.count, minimumCapacity: buffer.count)
+    buffer._copyContents(
+      subRange: buffer.indices,
+      initializing: newBuffer.firstElementAddress)
+    self = Self( _buffer: newBuffer, shiftedToStartIndex: buffer.startIndex)
   }
 
   @_inlineable
@@ -141,7 +153,7 @@ extension _ArrayBufferProtocol {
     _ subrange: Range<Int>,
     with newCount: Int,
     elementsOf newValues: C
-  ) where C : Collection, C.Iterator.Element == Element {
+  ) where C : Collection, C.Element == Element {
     _sanityCheck(startIndex == 0, "_SliceBuffer should override this function.")
     let oldCount = self.count
     let eraseCount = subrange.count
@@ -163,7 +175,7 @@ extension _ArrayBufferProtocol {
 
       // Assign over the original subrange
       var i = newValues.startIndex
-      for j in CountableRange(subrange) {
+      for j in subrange {
         elements[j] = newValues[i]
         newValues.formIndex(after: &i)
       }

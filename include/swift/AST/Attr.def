@@ -60,6 +60,9 @@ TYPE_ATTR(callee_guaranteed)
 TYPE_ATTR(objc_metatype)
 TYPE_ATTR(opened)
 TYPE_ATTR(pseudogeneric)
+TYPE_ATTR(yields)
+TYPE_ATTR(yield_once)
+TYPE_ATTR(yield_many)
 
 // SIL metatype attributes.
 TYPE_ATTR(thin)
@@ -108,7 +111,8 @@ SIMPLE_DECL_ATTR(noreturn, NoReturn, OnFunc, 7)
 
 SIMPLE_DECL_ATTR(_exported, Exported, OnImport | UserInaccessible, 8)
 
-/// NOTE: 9 is unused.
+SIMPLE_DECL_ATTR(dynamicMemberLookup, DynamicMemberLookup,
+                 OnClass | OnStruct | OnEnum | OnProtocol, 9)
 
 SIMPLE_DECL_ATTR(NSCopying, NSCopying,
                  OnVar, 10)
@@ -155,14 +159,12 @@ SIMPLE_DECL_ATTR(_transparent, Transparent,
                  OnFunc|OnConstructor|OnVar|UserInaccessible, 26)
 SIMPLE_DECL_ATTR(requires_stored_property_inits, RequiresStoredPropertyInits,
                  OnClass, 27)
-DECL_ATTR(autoclosure, AutoClosure, OnParam, 28)
-SIMPLE_DECL_ATTR(noescape, NoEscape, OnParam, 29)
 
 SIMPLE_DECL_ATTR(nonobjc, NonObjC,
                  OnExtension | OnFunc | OnVar | OnSubscript | OnConstructor, 30)
 
 SIMPLE_DECL_ATTR(_fixed_layout, FixedLayout,
-                 OnVar | OnClass | OnStruct | OnEnum | UserInaccessible, 31)
+                 OnVar | OnClass | OnStruct | UserInaccessible, 31)
 
 SIMPLE_DECL_ATTR(_inlineable, Inlineable,
                  OnVar | OnSubscript | OnFunc | OnConstructor | OnDestructor |
@@ -176,6 +178,8 @@ SIMPLE_DECL_ATTR(objcMembers, ObjCMembers, OnClass, 34)
 
 // Non-serialized attributes.
 
+SIMPLE_DECL_ATTR(__consuming, Consuming, OnFunc | DeclModifier | NotSerialized,
+                 /* Not serialized */ 40)
 SIMPLE_DECL_ATTR(mutating, Mutating, OnFunc | DeclModifier | NotSerialized,
                  /* Not serialized */ 41)
 SIMPLE_DECL_ATTR(nonmutating, NonMutating, OnFunc | DeclModifier | NotSerialized,
@@ -192,17 +196,17 @@ SIMPLE_DECL_ATTR(override, Override,
 SIMPLE_DECL_ATTR(sil_stored, SILStored, OnVar | NotSerialized | SILOnly,
                  /* Not serialized */45)
 
-DECL_ATTR(private, Accessibility,
+DECL_ATTR(private, AccessControl,
           OnFunc | OnExtension | OnTypeAlias | OnStruct | OnEnum |
           OnClass | OnProtocol | OnVar | OnSubscript | OnConstructor |
           DeclModifier | NotSerialized,
           /* Not serialized */ 46)
-DECL_ATTR_ALIAS(fileprivate, Accessibility)
-DECL_ATTR_ALIAS(internal, Accessibility)
-DECL_ATTR_ALIAS(public, Accessibility)
+DECL_ATTR_ALIAS(fileprivate, AccessControl)
+DECL_ATTR_ALIAS(internal, AccessControl)
+DECL_ATTR_ALIAS(public, AccessControl)
 
 
-DECL_ATTR(__accessibility, SetterAccessibility,
+DECL_ATTR(__setter_access, SetterAccess,
           OnVar | OnSubscript | DeclModifier | NotSerialized | RejectByParser,
           /* Not serialized */ 47)
 
@@ -210,9 +214,9 @@ DECL_ATTR(__raw_doc_comment, RawDocComment, OnAnyDecl |
           NotSerialized | RejectByParser, /* Not serialized */48)
 
 // Also handles unowned and unowned(weak).
-DECL_ATTR(weak, Ownership, OnVar | OnParam | DeclModifier | NotSerialized,
+DECL_ATTR(weak, ReferenceOwnership, OnVar | OnParam | DeclModifier | NotSerialized,
           /* Not serialized */49)
-DECL_ATTR_ALIAS(unowned, Ownership)
+DECL_ATTR_ALIAS(unowned, ReferenceOwnership)
 
 DECL_ATTR(effects, Effects, OnFunc | OnConstructor | OnDestructor |
           UserInaccessible, 50)
@@ -223,8 +227,8 @@ DECL_ATTR(__objc_bridged, ObjCBridged, OnClass | NotSerialized | RejectByParser,
 SIMPLE_DECL_ATTR(NSApplicationMain, NSApplicationMain,
                  OnClass, 52)
 
-SIMPLE_DECL_ATTR(objc_non_lazy_realization, ObjCNonLazyRealization,
-                 OnClass, 53)
+SIMPLE_DECL_ATTR(_objc_non_lazy_realization, ObjCNonLazyRealization,
+                 OnClass | UserInaccessible, 53)
 
 DECL_ATTR(__synthesized_protocol, SynthesizedProtocol,
           OnStruct | OnEnum | OnClass | NotSerialized | RejectByParser,
@@ -259,8 +263,8 @@ DECL_ATTR(_cdecl, CDecl,
 // FIXME: Replace with improved @available attribute.
 SIMPLE_DECL_ATTR(_versioned, Versioned,
                  OnFunc | OnVar | OnSubscript | OnConstructor |
-                 OnStruct | OnEnum | OnClass | OnProtocol |
-                 LongAttribute | UserInaccessible,
+                 OnDestructor | OnStruct | OnEnum | OnClass |
+                 OnProtocol | LongAttribute | UserInaccessible,
                  64)
 
 SIMPLE_DECL_ATTR(discardableResult, DiscardableResult,
@@ -273,18 +277,44 @@ DECL_ATTR(_implements, Implements,
           | NotSerialized | UserInaccessible,
           /* Not serialized */ 67)
 
-DECL_ATTR(NSKeyedArchiveLegacy, NSKeyedArchiveLegacy,
-          OnClass | NotSerialized | LongAttribute,
+DECL_ATTR(_objcRuntimeName, ObjCRuntimeName,
+          OnClass | NotSerialized | UserInaccessible | RejectByParser,
           /*Not serialized */ 68)
 
 SIMPLE_DECL_ATTR(_staticInitializeObjCMetadata, StaticInitializeObjCMetadata,
-                 OnClass | NotSerialized | LongAttribute | UserInaccessible,
+                 OnClass | NotSerialized | LongAttribute | RejectByParser,
                  /*Not serialized */ 69)
 
-SIMPLE_DECL_ATTR(NSKeyedArchiveSubclassesOnly,
-                 NSKeyedArchiveSubclassesOnly,
-                 OnClass | NotSerialized | LongAttribute,
-                 /*Not serialized */ 70)
+DECL_ATTR(_restatedObjCConformance, RestatedObjCConformance,
+          OnProtocol | NotSerialized | LongAttribute | RejectByParser,
+         /*Not serialized */ 70)
+
+// HACK: Attribute needed to preserve source compatibility by downgrading errors
+// due to an SDK change in Dispatch
+SIMPLE_DECL_ATTR(_downgrade_exhaustivity_check, DowngradeExhaustivityCheck,
+                 OnEnumElement | LongAttribute | UserInaccessible, 71)
+
+SIMPLE_DECL_ATTR(_implicitly_unwrapped_optional,
+                 ImplicitlyUnwrappedOptional,
+                 OnFunc | OnVar | OnParam | OnSubscript | OnConstructor
+                 | RejectByParser, 72)
+
+DECL_ATTR(_optimize, Optimize,
+          OnFunc | OnConstructor | OnDestructor | OnSubscript | OnVar |
+          UserInaccessible, 73)
+
+DECL_ATTR(_clangImporterSynthesizedType, ClangImporterSynthesizedType,
+          OnClass | OnStruct | OnEnum | OnProtocol | OnTypeAlias |
+          LongAttribute | NotSerialized | RejectByParser | UserInaccessible,
+          /*Not serialized*/74)
+
+SIMPLE_DECL_ATTR(_weakLinked, WeakLinked,
+                 OnEnum | OnStruct | OnClass | OnProtocol |
+                 OnFunc | OnVar | OnSubscript | OnConstructor | OnEnumElement |
+                 UserInaccessible,
+                 75)
+
+SIMPLE_DECL_ATTR(_frozen, Frozen, OnEnum | UserInaccessible, 76)
 
 #undef TYPE_ATTR
 #undef DECL_ATTR_ALIAS

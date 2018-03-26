@@ -3,6 +3,7 @@ set(datafiles
   ios.json
   tvos.json
   watchos.json
+  overlay.json
 )
 set(SWIFTLIB_DIR
     "${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR}/lib/swift")
@@ -15,13 +16,20 @@ add_custom_command(
 set(outputs)
 
 foreach(input ${datafiles})
-  add_custom_command(
-      OUTPUT "${output_dir}/${input}"
-      DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${input}"
-      COMMAND
-        "${CMAKE_COMMAND}" "-E" "create_symlink"
-        "${CMAKE_CURRENT_SOURCE_DIR}/${input}"
-        "${output_dir}/${input}")
+  set(source "${CMAKE_CURRENT_SOURCE_DIR}/${input}")
+  set(dest "${output_dir}/${input}")
+  if(CMAKE_SYSTEM_NAME STREQUAL Windows)
+    set(CMAKE_SYMLINK_COMMAND copy)
+  else()
+    set(CMAKE_SYMLINK_COMMAND create_symlink)
+  endif()
+
+  add_custom_command(OUTPUT
+                       "${output_dir}/${input}"
+                     DEPENDS
+                       "${CMAKE_CURRENT_SOURCE_DIR}/${input}"
+                     COMMAND
+                       "${CMAKE_COMMAND}" "-E" "${CMAKE_SYMLINK_COMMAND}" "${source}" "${dest}")
   list(APPEND outputs "${output_dir}/${input}")
 endforeach()
 list(APPEND outputs "${output_dir}")
@@ -35,12 +43,14 @@ swift_install_in_component(compiler
 DESTINATION "lib/swift/migrator")
 
 add_swift_library(swiftMigrator STATIC
+  APIDiffMigratorPass.cpp
   EditorAdapter.cpp
   FixitApplyDiagnosticConsumer.cpp
   Migrator.cpp
   MigrationState.cpp
   RewriteBufferEditsReceiver.cpp
-  SyntacticMigratorPass.cpp
+  TupleSplatMigratorPass.cpp
+  TypeOfMigratorPass.cpp
   LINK_LIBRARIES swiftSyntax swiftIDE)
 
 add_dependencies(swiftMigrator

@@ -19,11 +19,12 @@
 #include "Explosion.h"
 #include "GenEnum.h"
 #include "GenExistential.h"
-#include "GenMeta.h"
+#include "GenHeap.h"
 #include "GenProto.h"
 #include "IRGenDebugInfo.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
+#include "MetadataRequest.h"
 #include "TypeInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
@@ -224,7 +225,7 @@ void irgen::emitMetatypeDowncast(IRGenFunction &IGF,
                                  Explosion &ex) {
   // Pick a runtime entry point and target metadata based on what kind of
   // representation we're casting.
-  llvm::Value *castFn;
+  llvm::Constant *castFn;
   llvm::Value *toMetadata;
 
   switch (toMetatype->getRepresentation()) {
@@ -422,10 +423,7 @@ emitExistentialScalarCastFn(IRGenModule &IGM,
   }
 
   case CheckedCastMode::Unconditional: {
-    llvm::Function *trapIntrinsic = llvm::Intrinsic::getDeclaration(&IGM.Module,
-                                                    llvm::Intrinsic::ID::trap);
-    IGF.Builder.CreateCall(trapIntrinsic, {});
-    IGF.Builder.CreateUnreachable();
+    IGF.emitTrap(/*EmitUnreachable=*/true);
     break;
   }
   }
@@ -630,7 +628,7 @@ void irgen::emitScalarExistentialDowncast(IRGenFunction &IGF,
     
     // Pick the cast function based on the cast mode and on whether we're
     // casting a Swift metatype or ObjC object.
-    llvm::Value *castFn;
+    llvm::Constant *castFn;
     switch (mode) {
     case CheckedCastMode::Unconditional:
       castFn = objcObject
@@ -805,7 +803,7 @@ void irgen::emitScalarCheckedCast(IRGenFunction &IGF,
   assert(sourceType.isObject());
   assert(targetType.isObject());
 
-  if (auto sourceOptObjectType = sourceType.getAnyOptionalObjectType()) {
+  if (auto sourceOptObjectType = sourceType.getOptionalObjectType()) {
 
     // Translate the value from an enum representation to a possibly-null
     // representation.  Note that we assume that this projection is safe

@@ -67,7 +67,7 @@ openModuleFiles(StringRef DirName, StringRef ModuleFilename,
   Scratch.clear();
   llvm::sys::path::append(Scratch, DirName, ModuleDocFilename);
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> ModuleDocOrErr =
-  llvm::MemoryBuffer::getFile(StringRef(Scratch.data(), Scratch.size()));
+      llvm::MemoryBuffer::getFile(StringRef(Scratch.data(), Scratch.size()));
   if (!ModuleDocOrErr &&
       ModuleDocOrErr.getError() != std::errc::no_such_file_or_directory) {
     return ModuleDocOrErr.getError();
@@ -200,7 +200,10 @@ FileUnit *SerializedModuleLoader::loadAST(
                        isFramework, loadedModuleFile,
                        &extendedInfo);
   if (loadInfo.status == serialization::Status::Valid) {
-    M.setResilienceStrategy(extendedInfo.getResilienceStrategy());
+    // In LLDB always use the default resilience strategy, so IRGen can query
+    // the size of resilient types.
+    if (!Ctx.LangOpts.DebuggerSupport)
+      M.setResilienceStrategy(extendedInfo.getResilienceStrategy());
 
     // We've loaded the file. Now try to bring it into the AST.
     auto fileUnit = new (Ctx) SerializedASTFile(M, *loadedModuleFile,
@@ -232,7 +235,7 @@ FileUnit *SerializedModuleLoader::loadAST(
 
     SmallString<32> versionBuf;
     llvm::raw_svector_ostream versionString(versionBuf);
-    versionString << version::Version::getCurrentLanguageVersion();
+    versionString << Ctx.LangOpts.EffectiveLanguageVersion;
     if (versionString.str() == shortVersion)
       return false;
 
@@ -497,10 +500,6 @@ void SerializedASTFile::collectLinkLibraries(
   if (isSIB()) {
     collectLinkLibrariesFromImports(callback);
   } else {
-    if (File.getAssociatedModule()->getResilienceStrategy()
-        == ResilienceStrategy::Fragile) {
-      collectLinkLibrariesFromImports(callback);
-    }
     File.collectLinkLibraries(callback);
   }
 }
@@ -523,6 +522,12 @@ void SerializedASTFile::lookupValue(ModuleDecl::AccessPathTy accessPath,
 
 TypeDecl *SerializedASTFile::lookupLocalType(llvm::StringRef MangledName) const{
   return File.lookupLocalType(MangledName);
+}
+
+TypeDecl *
+SerializedASTFile::lookupNestedType(Identifier name,
+                                    const NominalTypeDecl *parent) const {
+  return File.lookupNestedType(name, parent);
 }
 
 OperatorDecl *SerializedASTFile::lookupOperator(Identifier name,
@@ -608,7 +613,7 @@ StringRef SerializedASTFile::getFilename() const {
   return File.getModuleFilename();
 }
 
-const clang::Module *SerializedASTFile::getUnderlyingClangModule() {
+const clang::Module *SerializedASTFile::getUnderlyingClangModule() const {
   if (auto *ShadowedModule = File.getShadowedModule())
     return ShadowedModule->findUnderlyingClangModule();
   return nullptr;

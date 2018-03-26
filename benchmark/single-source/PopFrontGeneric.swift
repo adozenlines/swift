@@ -12,6 +12,11 @@
 
 import TestsUtils
 
+public let PopFrontArrayGeneric = BenchmarkInfo(
+  name: "PopFrontArrayGeneric",
+  runFunction: run_PopFrontArrayGeneric,
+  tags: [.validation, .api, .Array])
+
 let reps = 1
 let arrayCount = 1024
 
@@ -19,8 +24,6 @@ let arrayCount = 1024
 // being really slow).
 @_versioned
 protocol MyArrayBufferProtocol : MutableCollection, RandomAccessCollection {
-  associatedtype Element
-
   mutating func myReplace<C>(
     _ subRange: Range<Int>,
     with newValues: C

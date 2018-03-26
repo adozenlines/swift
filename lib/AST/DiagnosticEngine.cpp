@@ -24,12 +24,13 @@
 #include "swift/AST/PrintOptions.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/Basic/SourceManager.h"
-#include "swift/Parse/Lexer.h" // bad dependency
 #include "swift/Config.h"
+#include "swift/Parse/Lexer.h" // bad dependency
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Twine.h"
-#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace swift;
 
@@ -79,6 +80,8 @@ static StoredDiagnosticInfo storedDiagnosticInfos[] = {
   StoredDiagnosticInfo(DiagnosticKind::Warning, DiagnosticOptions::Options),
 #define NOTE(ID, Options, Text, Signature)                                     \
   StoredDiagnosticInfo(DiagnosticKind::Note, DiagnosticOptions::Options),
+#define REMARK(ID, Options, Text, Signature)                                   \
+  StoredDiagnosticInfo(DiagnosticKind::Remark, DiagnosticOptions::Options),
 #include "swift/AST/DiagnosticsAll.def"
 };
 static_assert(sizeof(storedDiagnosticInfos) / sizeof(StoredDiagnosticInfo) ==
@@ -89,6 +92,7 @@ static const char *diagnosticStrings[] = {
 #define ERROR(ID, Options, Text, Signature) Text,
 #define WARNING(ID, Options, Text, Signature) Text,
 #define NOTE(ID, Options, Text, Signature) Text,
+#define REMARK(ID, Options, Text, Signature) Text,
 #include "swift/AST/DiagnosticsAll.def"
     "<not a diagnostic>",
 };
@@ -247,6 +251,14 @@ bool DiagnosticEngine::isDiagnosticPointsToFirstBadToken(DiagID ID) const {
   return storedDiagnosticInfos[(unsigned) ID].pointsToFirstBadToken;
 }
 
+bool DiagnosticEngine::finishProcessing() {
+  bool hadError = false;
+  for (auto &Consumer : Consumers) {
+    hadError |= Consumer->finishProcessing();
+  }
+  return hadError;
+}
+
 /// \brief Skip forward to one of the given delimiters.
 ///
 /// \param Text The text to search through, which will be updated to point
@@ -315,6 +327,9 @@ static void formatSelectionArgument(StringRef ModifierArguments,
 }
 
 static bool isInterestingTypealias(Type type) {
+  // Bound name alias types are always interesting.
+  if (isa<BoundNameAliasType>(type.getPointer())) return true;
+
   auto aliasTy = dyn_cast<NameAliasType>(type.getPointer());
   if (!aliasTy)
     return false;
@@ -421,9 +436,9 @@ static void formatDiagnosticArgument(StringRef Modifier,
     break;
 
   case DiagnosticArgumentKind::ValueDecl:
-    Out << '\'';
+    Out << FormatOpts.OpeningQuotationMark;
     Arg.getAsValueDecl()->getFullName().printPretty(Out);
-    Out << '\'';
+    Out << FormatOpts.ClosingQuotationMark;
     break;
 
   case DiagnosticArgumentKind::Type: {
@@ -570,10 +585,17 @@ static DiagnosticKind toDiagnosticKind(DiagnosticState::Behavior behavior) {
     return DiagnosticKind::Note;
   case DiagnosticState::Behavior::Warning:
     return DiagnosticKind::Warning;
+  case DiagnosticState::Behavior::Remark:
+    return DiagnosticKind::Remark;
   }
 
   llvm_unreachable("Unhandled DiagnosticKind in switch.");
 }
+
+/// A special option only for compiler writers that causes Diagnostics to assert
+/// when a failure diagnostic is emitted. Intended for use in the debugger.
+llvm::cl::opt<bool> AssertOnError("swift-diagnostics-assert-on-error",
+                                  llvm::cl::init(false));
 
 DiagnosticState::Behavior DiagnosticState::determineBehavior(DiagID id) {
   auto set = [this](DiagnosticState::Behavior lvl) {
@@ -584,6 +606,7 @@ DiagnosticState::Behavior DiagnosticState::determineBehavior(DiagID id) {
       anyErrorOccurred = true;
     }
 
+    assert((!AssertOnError || !anyErrorOccurred) && "We emitted an error?!");
     previousBehavior = lvl;
     return lvl;
   };
@@ -633,6 +656,8 @@ DiagnosticState::Behavior DiagnosticState::determineBehavior(DiagID id) {
     return set(diagInfo.isFatal ? Behavior::Fatal : Behavior::Error);
   case DiagnosticKind::Warning:
     return set(Behavior::Warning);
+  case DiagnosticKind::Remark:
+    return set(Behavior::Remark);
   }
 
   llvm_unreachable("Unhandled DiagnosticKind in switch.");
@@ -744,7 +769,7 @@ void DiagnosticEngine::emitDiagnostic(const Diagnostic &diagnostic) {
           }
 
           if (auto value = dyn_cast<ValueDecl>(ppDecl)) {
-            bufferName += value->getNameStr();
+            bufferName += value->getBaseName().userFacingName();
           } else if (auto ext = dyn_cast<ExtensionDecl>(ppDecl)) {
             bufferName += ext->getExtendedType().getString();
           }

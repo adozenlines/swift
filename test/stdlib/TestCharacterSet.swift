@@ -114,6 +114,16 @@ class TestCharacterSet : TestCharacterSetSuper {
       expectTrue(characters.contains(problematicChar))
     }
 
+    func testUpperBoundaryInsert_SR_2988() {
+      // "CharacterSet.insert(_: Unicode.Scalar) crashes on U+D7FF"
+      let problematicChar = UnicodeScalar(0xD7FF)!
+      var characters = CharacterSet()
+      characters.insert(problematicChar) // this should not crash
+      expectTrue(characters.contains(problematicChar))
+      characters.remove(problematicChar) // this should not crash
+      expectTrue(!characters.contains(problematicChar))
+    }
+
     func testInsertAndRemove() {
         var asciiUppercase = CharacterSet(charactersIn: UnicodeScalar(0x41)!...UnicodeScalar(0x5A)!)
         expectTrue(asciiUppercase.contains(UnicodeScalar(0x49)!))
@@ -301,6 +311,10 @@ class TestCharacterSet : TestCharacterSetSuper {
         #endif
         */
     }
+
+    func test_unconditionallyBridgeFromObjectiveC() {
+        expectEqual(CharacterSet(), CharacterSet._unconditionallyBridgeFromObjectiveC(nil))
+    }
 }
 
 #if !FOUNDATION_XCTEST
@@ -325,6 +339,9 @@ CharacterSetTests.test("test_hasMember") { TestCharacterSet().test_hasMember() }
 CharacterSetTests.test("test_bitmap") { TestCharacterSet().test_bitmap() }
 CharacterSetTests.test("test_setOperationsOfEmptySet") { TestCharacterSet().test_setOperationsOfEmptySet() }
 CharacterSetTests.test("test_moreSetOperations") { TestCharacterSet().test_moreSetOperations() }
+CharacterSetTests.test("test_unconditionallyBridgeFromObjectiveC") { TestCharacterSet().test_unconditionallyBridgeFromObjectiveC() }
+CharacterSetTests.test("testClosedRanges_SR_2988") { TestCharacterSet().testClosedRanges_SR_2988() }
+CharacterSetTests.test("testUpperBoundaryInsert_SR_2988") { TestCharacterSet().testUpperBoundaryInsert_SR_2988() }
 runAllTests()
 #endif
 

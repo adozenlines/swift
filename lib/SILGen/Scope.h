@@ -31,11 +31,14 @@ class LLVM_LIBRARY_VISIBILITY Scope {
   CleanupsDepth depth;
   CleanupsDepth savedInnermostScope;
   CleanupLocation loc;
+  PostponedCleanup *currentlyActivePostponedCleanup;
 
 public:
   explicit Scope(CleanupManager &cleanups, CleanupLocation loc)
       : cleanups(cleanups), depth(cleanups.getCleanupsDepth()),
-        savedInnermostScope(cleanups.innermostScope), loc(loc) {
+        savedInnermostScope(cleanups.innermostScope), loc(loc),
+        currentlyActivePostponedCleanup(
+            cleanups.SGF.CurrentlyActivePostponedCleanup) {
     assert(depth.isValid());
     cleanups.stack.checkIterator(cleanups.innermostScope);
     cleanups.innermostScope = depth;
@@ -57,28 +60,18 @@ public:
 
   bool isValid() const { return depth.isValid(); }
 
-  ManagedValue popPreservingValue(ManagedValue mv) {
-    // If we have a value, make sure that it is an object. The reason why is
-    // that we want to make sure that we are not forwarding a cleanup for a
-    // stack location that will be destroyed by this scope.
-    assert(!mv.getValue() || mv.getType().isObject());
-    CleanupCloner cloner(cleanups.SGF, mv);
-    SILValue value = mv.forward(cleanups.SGF);
-    pop();
-    return cloner.clone(value);
-  }
+  /// Pop the scope pushing the +1 ManagedValue through the scope. Asserts if mv
+  /// is a plus zero managed value.
+  ManagedValue popPreservingValue(ManagedValue mv);
+
+  /// Pop this scope pushing the +1 rvalue through the scope. Asserts if rv is a
+  /// plus zero rvalue.
+  RValue popPreservingValue(RValue &&rv);
 
 private:
-  void popImpl() {
-    cleanups.stack.checkIterator(depth);
-    cleanups.stack.checkIterator(cleanups.innermostScope);
-    assert(cleanups.innermostScope == depth && "popping scopes out of order");
-
-    cleanups.innermostScope = savedInnermostScope;
-    cleanups.endScope(depth, loc);
-    cleanups.stack.checkIterator(cleanups.innermostScope);
-    cleanups.popTopDeadCleanups(cleanups.innermostScope);
-  }
+  /// Internal private implementation of popImpl so we can use it in Scope::pop
+  /// and in Scope's destructor.
+  void popImpl();
 };
 
 /// A FullExpr is a RAII object recording that a full-expression has

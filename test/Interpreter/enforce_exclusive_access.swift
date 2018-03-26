@@ -1,6 +1,5 @@
-// RUN: rm -rf %t
-// RUN: mkdir -p %t
-// RUN: %target-build-swift %s -o %t/a.out -enforce-exclusivity=checked -Onone
+// RUN: %empty-directory(%t)
+// RUN: %target-build-swift -swift-version 4 %s -o %t/a.out -enforce-exclusivity=checked -Onone
 //
 // RUN: %target-run %t/a.out
 // REQUIRES: executable_test
@@ -21,7 +20,7 @@ func readAndPerform<T>(_ _: UnsafePointer<T>, closure: () ->()) {
   closure()
 }
 
-/// Begin a modify access to the first paraemter and call the closure inside it.
+/// Begin a modify access to the first parameter and call the closure inside it.
 func modifyAndPerform<T>(_ _: UnsafeMutablePointer<T>, closure: () ->()) {
   closure()
 }
@@ -47,7 +46,8 @@ ExclusiveAccessTestSuite.test("ModifyInsideRead")
   .skip(.custom(
     { _isFastAssertConfiguration() },
     reason: "this trap is not guaranteed to happen in -Ounchecked"))
-  .crashOutputMatches("modify/read access conflict detected on address")
+  .crashOutputMatches("Previous access (a read) started at")
+  .crashOutputMatches("Current access (a modification) started at")
   .code
 {
   readAndPerform(&globalX) {
@@ -60,7 +60,8 @@ ExclusiveAccessTestSuite.test("ReadInsideModify")
   .skip(.custom(
     { _isFastAssertConfiguration() },
     reason: "this trap is not guaranteed to happen in -Ounchecked"))
-  .crashOutputMatches("read/modify access conflict detected on address")
+  .crashOutputMatches("Previous access (a modification) started at")
+  .crashOutputMatches("Current access (a read) started at")
   .code
 {
   modifyAndPerform(&globalX) {
@@ -74,7 +75,8 @@ ExclusiveAccessTestSuite.test("ModifyInsideModify")
   .skip(.custom(
     { _isFastAssertConfiguration() },
     reason: "this trap is not guaranteed to happen in -Ounchecked"))
-  .crashOutputMatches("modify/modify access conflict detected on address")
+  .crashOutputMatches("Previous access (a modification) started at")
+  .crashOutputMatches("Current access (a modification) started at")
   .code
 {
   modifyAndPerform(&globalX) {
@@ -101,48 +103,6 @@ ExclusiveAccessTestSuite.test("ModifyFollowedByModify") {
   globalX = X() // no-trap
 }
 
-ExclusiveAccessTestSuite.test("ClosureCaptureModifyModify")
-.skip(.custom(
-    { _isFastAssertConfiguration() },
-    reason: "this trap is not guaranteed to happen in -Ounchecked"))
-  .crashOutputMatches("modify/modify access conflict detected on address")
-  .code
-{
-  var x = X()
-  modifyAndPerform(&x) {
-    expectCrashLater()
-    x.i = 12
-  }
-}
-
-ExclusiveAccessTestSuite.test("ClosureCaptureReadModify")
-.skip(.custom(
-    { _isFastAssertConfiguration() },
-    reason: "this trap is not guaranteed to happen in -Ounchecked"))
-  .crashOutputMatches("read/modify access conflict detected on address")
-  .code
-{
-  var x = X()
-  modifyAndPerform(&x) {
-    expectCrashLater()
-    _blackHole(x.i)
-  }
-}
-
-ExclusiveAccessTestSuite.test("ClosureCaptureModifyRead")
-.skip(.custom(
-    { _isFastAssertConfiguration() },
-    reason: "this trap is not guaranteed to happen in -Ounchecked"))
-  .crashOutputMatches("modify/read access conflict detected on address")
-  .code
-{
-  var x = X()
-  readAndPerform(&x) {
-    expectCrashLater()
-    x.i = 12
-  }
-}
-
 ExclusiveAccessTestSuite.test("ClosureCaptureReadRead") {
   var x = X()
   readAndPerform(&x) {
@@ -163,6 +123,144 @@ ExclusiveAccessTestSuite.test("PerThreadEnforcement") {
   }
 }
 
+// Helpers
+func doOne(_ f: () -> ()) { f() }
+
+func doTwo(_ f1: ()->(), _ f2: ()->()) { f1(); f2() }
+
+// No crash.
+ExclusiveAccessTestSuite.test("WriteNoescapeWrite") {
+  var x = 3
+  let c = { x = 7 }
+  // Inside may-escape closure `c`: [read] [dynamic]
+  // Inside never-escape closure: [modify] [dynamic]
+  doTwo(c, { x = 42 })
+  _blackHole(x)
+}
+
+// No crash.
+ExclusiveAccessTestSuite.test("InoutReadEscapeRead") {
+  var x = 3
+  let c = { let y = x; _blackHole(y) }
+  readAndPerform(&x, closure: c)
+  _blackHole(x)
+}
+
+ExclusiveAccessTestSuite.test("InoutReadEscapeWrite")
+  .skip(.custom(
+    { _isFastAssertConfiguration() },
+    reason: "this trap is not guaranteed to happen in -Ounchecked"))
+  .crashOutputMatches("Previous access (a read) started at")
+  .crashOutputMatches("Current access (a modification) started at")
+  .code
+{
+  var x = 3
+  let c = { x = 42 }
+  expectCrashLater()
+  readAndPerform(&x, closure: c) 
+  _blackHole(x)
+}
+
+ExclusiveAccessTestSuite.test("InoutWriteEscapeRead")
+  .skip(.custom(
+    { _isFastAssertConfiguration() },
+    reason: "this trap is not guaranteed to happen in -Ounchecked"))
+  .crashOutputMatches("Previous access (a modification) started at")
+  .crashOutputMatches("Current access (a read) started at")
+  .code
+{
+  var x = 3
+  let c = { let y = x; _blackHole(y) }
+  expectCrashLater()
+  modifyAndPerform(&x, closure: c)
+  _blackHole(x)
+}
+
+ExclusiveAccessTestSuite.test("InoutWriteEscapeWrite")
+  .skip(.custom(
+    { _isFastAssertConfiguration() },
+    reason: "this trap is not guaranteed to happen in -Ounchecked"))
+  .crashOutputMatches("Previous access (a modification) started at")
+  .crashOutputMatches("Current access (a modification) started at")
+  .code
+{
+  var x = 3
+  let c = { x = 42 }
+  expectCrashLater()
+  modifyAndPerform(&x, closure: c)
+  _blackHole(x)
+}
+
+// No crash.
+ExclusiveAccessTestSuite.test("InoutReadNoescapeRead") {
+  var x = 3
+  let c = { let y = x; _blackHole(y) }
+  doOne { readAndPerform(&x, closure: c) }
+}
+
+ExclusiveAccessTestSuite.test("InoutReadNoescapeWrite")
+  .skip(.custom(
+    { _isFastAssertConfiguration() },
+    reason: "this trap is not guaranteed to happen in -Ounchecked"))
+  .crashOutputMatches("Previous access (a read) started at")
+  .crashOutputMatches("Current access (a modification) started at")
+  .code
+{
+  var x = 3
+  let c = { x = 7 }
+  expectCrashLater()
+  doOne { readAndPerform(&x, closure: c) }
+}
+
+ExclusiveAccessTestSuite.test("InoutWriteEscapeRead")
+  .skip(.custom(
+    { _isFastAssertConfiguration() },
+    reason: "this trap is not guaranteed to happen in -Ounchecked"))
+  .crashOutputMatches("Previous access (a modification) started at")
+  .crashOutputMatches("Current access (a read) started at")
+  .code
+{
+  var x = 3
+  let c = { let y = x; _blackHole(y) }
+  expectCrashLater()
+  doOne { modifyAndPerform(&x, closure: c) }
+}
+
+ExclusiveAccessTestSuite.test("InoutWriteEscapeWrite")
+  .skip(.custom(
+    { _isFastAssertConfiguration() },
+    reason: "this trap is not guaranteed to happen in -Ounchecked"))
+  .crashOutputMatches("Previous access (a modification) started at")
+  .crashOutputMatches("Current access (a modification) started at")
+  .code
+{
+  var x = 3
+  let c = { x = 7 }
+  expectCrashLater()
+  doOne { modifyAndPerform(&x, closure: c) }
+}
+
+class ClassWithStoredProperty {
+  var f = 7
+}
+
+// FIXME: This should trap with a modify/modify violation at run time.
+ExclusiveAccessTestSuite.test("KeyPathClassStoredProp")
+  .skip(.custom(
+    { _isFastAssertConfiguration() },
+    reason: "this trap is not guaranteed to happen in -Ounchecked"))
+//  .crashOutputMatches("Previous access (a modification) started at")
+//  .crashOutputMatches("Current access (a modification) started at")
+  .code
+{
+  let getF = \ClassWithStoredProperty.f
+  let c = ClassWithStoredProperty()
+
+//  expectCrashLater()
+  modifyAndPerform(&c[keyPath: getF]) {
+    c[keyPath: getF] = 12
+  }
+}
 
 
 runAllTests()

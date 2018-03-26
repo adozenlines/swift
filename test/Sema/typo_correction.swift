@@ -1,5 +1,6 @@
-// RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -typo-correction-limit 20
 // RUN: not %target-swift-frontend -typecheck -disable-typo-correction %s 2>&1 | %FileCheck %s -check-prefix=DISABLED
+// RUN: not %target-swift-frontend -typecheck -typo-correction-limit 0 %s 2>&1 | %FileCheck %s -check-prefix=DISABLED
 // RUN: not %target-swift-frontend -typecheck -DIMPORT_FAIL %s 2>&1 | %FileCheck %s -check-prefix=DISABLED
 // DISABLED-NOT: did you mean
 
@@ -82,7 +83,7 @@ func test_too_many_but_some_better() {
 // type variables.
 _ = [Any]().withUnsafeBufferPointer { (buf) -> [Any] in
   guard let base = buf.baseAddress else { return [] }
-  return (base ..< base + buf.count).m // expected-error {{value of type 'CountableRange<_>' has no member 'm'}}
+  return (base ..< base + buf.count).m // expected-error {{value of type 'Range<UnsafePointer<Any>>' has no member 'm'}}
 }
 
 // Typo correction with class-bound archetypes.
@@ -118,4 +119,19 @@ func takesAnyObject(_ t: AnyObject) {
 func takesAnyObjectArchetype<T : AnyObject>(_ t: T) {
   _ = t.rawPointer
   // expected-error@-1 {{value of type 'T' has no member 'rawPointer'}}
+}
+
+// Typo correction with an UnresolvedDotExpr.
+enum Foo {
+  // note: the fixit is actually for the line with the error below, but
+  // -verify mode is not smart enough for that yet.
+
+  case flashing // expected-note {{did you mean 'flashing'?}}{{8-15=flashing}}
+}
+
+func foo(_ a: Foo) {
+}
+
+func bar() {
+  foo(.flashin) // expected-error {{type 'Foo' has no member 'flashin'}}
 }

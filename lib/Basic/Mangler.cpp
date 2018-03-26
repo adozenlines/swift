@@ -90,8 +90,8 @@ void Mangle::printManglingStats() {
   }
   
   llvm::outs() << "Mangling operator stats:\n";
-  
-  typedef llvm::StringMapEntry<OpStatEntry> MapEntry;
+
+  using MapEntry = llvm::StringMapEntry<OpStatEntry>;
   std::vector<const MapEntry *> SortedOpStats;
   for (const MapEntry &ME : OpStats) {
     SortedOpStats.push_back(&ME);
@@ -110,12 +110,16 @@ void Mangle::printManglingStats() {
 #endif
 }
 
-void Mangler::beginMangling() {
+void Mangler::beginManglingWithoutPrefix() {
   Storage.clear();
   Substitutions.clear();
   StringSubstitutions.clear();
   Words.clear();
   SubstMerging.clear();
+}
+
+void Mangler::beginMangling() {
+  beginManglingWithoutPrefix();
   Buffer << MANGLING_PREFIX_STR;
 }
 
@@ -204,6 +208,10 @@ void Mangler::appendIdentifier(StringRef ident) {
   mangleIdentifier(*this, ident);
 
   recordOpStat("<identifier>", OldPos);
+}
+
+void Mangler::dump() {
+  llvm::errs() << Buffer.str() << '\n';
 }
 
 bool Mangler::tryMangleSubstitution(const void *ptr) {

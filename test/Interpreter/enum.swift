@@ -1,4 +1,4 @@
-// RUN: rm -rf %t  &&  mkdir -p %t
+// RUN: %empty-directory(%t)
 // RUN: %target-build-swift %s -o %t/a.out
 // RUN: %target-run %t/a.out | %FileCheck %s
 // REQUIRES: executable_test
@@ -425,8 +425,8 @@ test_spare_bit_aggregate(.x(22, 44))
 // CHECK: X(222)
 // CHECK: X(444)
 // CHECK: .y(222, 444)
-// CHECK-DAG-64: ~X(222)
-// CHECK-DAG-64: ~X(444)
+// CHECK-DAG: ~X(222)
+// CHECK-DAG: ~X(444)
 test_spare_bit_aggregate(.y(Rdar15383966(222), Rdar15383966(444)))
 // CHECK: .z(S(a: 333, b: 666))
 test_spare_bit_aggregate(.z(S(333, 666)))
@@ -553,5 +553,117 @@ presentEitherOr(EitherOr<(), String>.Right("foo")) // CHECK-NEXT: Right(foo)
 // CHECK-NEXT: Right(foo)
 presentEitherOrsOf(t: (), u: "foo")
 
+// SR-5148
+enum Payload {
+    case email
+}
+enum Test {
+    case a
+    indirect case b(Payload)
+}
+
+@inline(never)
+func printA() {
+    print("an a")
+}
+
+@inline(never)
+func printB() {
+    print("an b")
+}
+
+@inline(never)
+func testCase(_ testEmail: Test) {
+  switch testEmail {
+    case .a:
+      printA()
+    case .b:
+      printB()
+  }
+}
+
+@inline(never)
+func createTestB() -> Test  {
+  return Test.b(.email)
+}
+
+@inline(never)
+func createTestA() -> Test  {
+  return Test.a
+}
+
+// CHECK-NEXT: an b
+testCase(createTestB())
+// CHECK-NEXT: b(a.Payload.email)
+print(createTestB())
+// CHECK-NEXT: a
+print(createTestA())
 // CHECK-NEXT: done
 print("done")
+
+public enum MyOptional<T> {
+  case Empty
+  case SecondEmpty
+  case Some(T)
+}
+
+public class StopSpecialization {
+  public func generate<T>(_ e: T) -> MyOptional<T> {
+    return MyOptional.Some(e)
+  }
+  public func generate2<T>(_ e: T) -> MyOptional<T> {
+    return MyOptional.Empty
+  }
+}
+
+@inline(never)
+func test(_ s : StopSpecialization, _ N: Int) -> Bool {
+  let x = s.generate(N)
+  switch x {
+    case .SecondEmpty:
+      return false
+    case .Empty:
+      return false
+    case .Some(_):
+      return true
+  }
+}
+
+@inline(never)
+func test2(_ s : StopSpecialization, _ N: Int) -> Bool {
+  let x = s.generate2(N)
+  switch x {
+    case .SecondEmpty:
+      return false
+    case .Empty:
+      return true
+    case .Some(_):
+      return false
+  }
+}
+
+@inline(never)
+func run() {
+// CHECK: true
+  print(test(StopSpecialization(), 12))
+// CHECK: true
+  print(test2(StopSpecialization(), 12))
+}
+
+run()
+
+public enum Indirect<T> {
+  indirect case payload((T, other: T))
+  case none
+}
+
+public func testIndirectEnum<T>(_ payload: T) -> Indirect<T> {
+  return Indirect.payload((payload, other: payload))
+}
+
+public func testCase(_ closure: @escaping (Int) -> ()) -> Indirect<(Int) -> ()> {
+  return testIndirectEnum(closure)
+}
+
+// CHECK: payload((Function), other: (Function))
+print(testCase({ _ in }))

@@ -36,6 +36,10 @@ endif()
 # we get link failures regardless, so instead, this just disables the checks.
 append("-DLLVM_DISABLE_ABI_BREAKING_CHECKS_ENFORCING=1" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
 
+if(SWIFT_ENABLE_GUARANTEED_NORMAL_ARGUMENTS)
+  append("-DSWIFT_RUNTIME_ENABLE_GUARANTEED_NORMAL_ARGUMENTS=1" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
+endif()
+
 set(SWIFT_STDLIB_LIBRARY_BUILD_TYPES)
 if(SWIFT_BUILD_DYNAMIC_STDLIB)
   list(APPEND SWIFT_STDLIB_LIBRARY_BUILD_TYPES SHARED)
@@ -91,17 +95,6 @@ add_custom_target(swift-stdlib-sibgen
 add_custom_target(swift-test-stdlib ALL
     DEPENDS "swift-test-stdlib${SWIFT_PRIMARY_VARIANT_SUFFIX}")
 
-if(SWIFT_STDLIB_ENABLE_RESILIENCE)
-  set(STDLIB_SIL_SERIALIZE_ALL)
-else()
-  if(SWIFT_STDLIB_SIL_SERIALIZE_ALL)
-    set(STDLIB_SIL_SERIALIZE_ALL "-Xfrontend" "-sil-serialize-all")
-  else()
-    set(STDLIB_SIL_SERIALIZE_ALL)
-  endif()
-endif()
-
 add_subdirectory(public)
-add_subdirectory(internal)
 add_subdirectory(private)
 

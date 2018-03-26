@@ -1,4 +1,4 @@
-// RUN: rm -rf %t && mkdir -p %t
+// RUN: %empty-directory(%t)
 // RUN: %target-swift-frontend -emit-module -module-name Library -o %t -D LIBRARY %s
 // RUN: %target-swift-ide-test -print-module -module-to-print=Library -I %t -source-filename=%s | %FileCheck %s
 // RUN: %target-swift-frontend -typecheck -I %t %s -verify
@@ -9,6 +9,9 @@
 #if LIBRARY
 
 public typealias Zahl = Int
+
+// CHECK: typealias List
+// CHECK: typealias Zahl
 
 // CHECK-LABEL: extension Int {
 extension Zahl {
@@ -29,9 +32,6 @@ extension List where Element == Int {
   // CHECK-NEXT: addedMemberInt()
   public func addedMemberInt() {}
 } // CHECK-NEXT: {{^}$}}
-
-// CHECK: typealias List
-// CHECK: typealias Zahl
 
 #else
 

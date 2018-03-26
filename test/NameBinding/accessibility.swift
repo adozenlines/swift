@@ -1,4 +1,4 @@
-// RUN: rm -rf %t && mkdir -p %t
+// RUN: %empty-directory(%t)
 // RUN: cp %s %t/main.swift
 
 // RUN: %target-swift-frontend -emit-module -o %t %S/Inputs/has_accessibility.swift -D DEFINE_VAR_FOR_SCOPED_IMPORT -enable-testing
@@ -126,7 +126,7 @@ extension Foo : TypeProto {} // expected-error {{type 'Foo' does not conform to 
 #if !ACCESS_DISABLED
 private func privateInBothFiles() {} // no-warning
 private func privateInPrimaryFile() {} // expected-error {{invalid redeclaration}}
-func privateInOtherFile() {} // expected-note {{previously declared here}}
+func privateInOtherFile() {}
 #endif
 
 

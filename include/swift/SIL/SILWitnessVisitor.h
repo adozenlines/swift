@@ -21,11 +21,10 @@
 
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/ProtocolAssociations.h"
 #include "swift/AST/Types.h"
 #include "swift/SIL/TypeLowering.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/raw_ostream.h"
 
 namespace swift {
 
@@ -49,6 +48,9 @@ template <class T> class SILWitnessVisitor : public ASTVisitor<T> {
 
 public:
   void visitProtocolDecl(ProtocolDecl *protocol) {
+    // The protocol conformance descriptor gets added first.
+    asDerived().addProtocolConformanceDescriptor();
+
     // Associated types get added after the inherited conformances, but
     // before all the function requirements.
     bool haveAddedAssociatedTypes = false;
@@ -59,13 +61,12 @@ public:
       for (Decl *member : protocol->getMembers()) {
         if (auto associatedType = dyn_cast<AssociatedTypeDecl>(member)) {
           // TODO: only add associated types when they're new?
-          asDerived().addAssociatedType(associatedType);
+          asDerived().addAssociatedType(AssociatedType(associatedType));
         }
       }
     };
 
-    for (auto &reqt : protocol->getRequirementSignature()
-                              ->getCanonicalSignature()->getRequirements()) {
+    for (const auto &reqt : protocol->getRequirementSignature()) {
       switch (reqt.getKind()) {
       // These requirements don't show up in the witness table.
       case RequirementKind::Superclass:
@@ -74,10 +75,11 @@ public:
         continue;
 
       case RequirementKind::Conformance: {
-        auto type = CanType(reqt.getFirstType());
+        auto type = reqt.getFirstType()->getCanonicalType();
         assert(type->isTypeParameter());
         auto requirement =
-          cast<ProtocolType>(CanType(reqt.getSecondType()))->getDecl();
+          cast<ProtocolType>(reqt.getSecondType()->getCanonicalType())
+            ->getDecl();
 
         // ObjC protocols do not have witnesses.
         if (!Lowering::TypeConverter::protocolRequiresWitnessTable(requirement))
@@ -100,7 +102,8 @@ public:
         addAssociatedTypes();
 
         // Otherwise, add an associated requirement.
-        asDerived().addAssociatedConformance(type, requirement);
+        AssociatedConformance assocConf(protocol, type, requirement);
+        asDerived().addAssociatedConformance(assocConf);
         continue;
       }
       }
@@ -117,30 +120,36 @@ public:
 
   /// Fallback for unexpected protocol requirements.
   void visitDecl(Decl *d) {
-#ifndef NDEBUG
-    d->print(llvm::errs());
-#endif
     llvm_unreachable("unhandled protocol requirement");
   }
 
   void visitAbstractStorageDecl(AbstractStorageDecl *sd) {
-    asDerived().addMethod(sd->getGetter());
+    asDerived().addMethod(SILDeclRef(sd->getGetter(),
+                                     SILDeclRef::Kind::Func));
     if (sd->isSettable(sd->getDeclContext())) {
-      asDerived().addMethod(sd->getSetter());
+      asDerived().addMethod(SILDeclRef(sd->getSetter(),
+                                       SILDeclRef::Kind::Func));
       if (sd->getMaterializeForSetFunc())
-        asDerived().addMethod(sd->getMaterializeForSetFunc());
+        asDerived().addMethod(SILDeclRef(sd->getMaterializeForSetFunc(),
+                                         SILDeclRef::Kind::Func));
     }
   }
 
   void visitConstructorDecl(ConstructorDecl *cd) {
-    asDerived().addConstructor(cd);
+    asDerived().addMethod(SILDeclRef(cd, SILDeclRef::Kind::Allocator));
+  }
+
+  void visitAccessorDecl(AccessorDecl *func) {
+    // Accessors are emitted by visitAbstractStorageDecl, above.
   }
 
   void visitFuncDecl(FuncDecl *func) {
-    // Accessors are emitted by their var/subscript declaration.
-    if (func->isAccessor())
-      return;
-    asDerived().addMethod(func);
+    assert(!isa<AccessorDecl>(func));
+    asDerived().addMethod(SILDeclRef(func, SILDeclRef::Kind::Func));
+  }
+
+  void visitMissingMemberDecl(MissingMemberDecl *placeholder) {
+    asDerived().addPlaceholder(placeholder);
   }
 
   void visitAssociatedTypeDecl(AssociatedTypeDecl *td) {
@@ -158,6 +167,10 @@ public:
   void visitIfConfigDecl(IfConfigDecl *icd) {
     // We only care about the active members, which were already subsumed by the
     // enclosing type.
+  }
+
+  void visitPoundDiagnosticDecl(PoundDiagnosticDecl *pdd) {
+    // We don't care about diagnostics at this stage.
   }
 };
 

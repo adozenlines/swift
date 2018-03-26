@@ -15,6 +15,11 @@
 import Foundation
 import TestsUtils
 
+public let SortLettersInPlace = BenchmarkInfo(
+  name: "SortLettersInPlace",
+  runFunction: run_SortLettersInPlace,
+  tags: [.validation, .api, .algorithm, .String])
+
 class Letter {
   let value: String
   init(_ value: String) {
@@ -42,4 +47,3 @@ public func run_SortLettersInPlace(_ N: Int) {
     CheckResults(letters[0].value <= letters[letters.count/2].value)
   }
 }
-

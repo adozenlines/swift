@@ -1,7 +1,8 @@
-// RUN: rm -rf %t && mkdir -p %t
+
+// RUN: %empty-directory(%t)
 // RUN: %build-silgen-test-overlays
 
-// RUN: %target-swift-frontend(mock-sdk: -sdk %S/Inputs -I %t) -Xllvm -sil-full-demangle -primary-file %s -emit-silgen | %FileCheck %s
+// RUN: %target-swift-frontend(mock-sdk: -sdk %S/Inputs -I %t) -module-name inlineable_attribute_objc -Xllvm -sil-full-demangle -primary-file %s -emit-silgen | %FileCheck %s
 
 // REQUIRES: objc_interop
 
@@ -14,18 +15,18 @@ public class Horse : NSObject {
 // Make sure we can reference dynamic thunks and curry thunks
 // from inlineable scopes
 
-// CHECK-LABEL: sil [serialized] @_T025inlineable_attribute_objc15talkAboutAHorseyAA5HorseC1h_tF : $@convention(thin) (@owned Horse) -> () {
-// CHECK: function_ref @_T025inlineable_attribute_objc5HorseC6gallopyyFTc : $@convention(thin) (@owned Horse) -> @owned @callee_owned () -> ()
+// CHECK-LABEL: sil [serialized] @$S25inlineable_attribute_objc15talkAboutAHorse1hyAA5HorseC_tF : $@convention(thin) (@guaranteed Horse) -> () {
+// CHECK: function_ref @$S25inlineable_attribute_objc5HorseC6gallopyyFTc : $@convention(thin) (@guaranteed Horse) -> @owned @callee_guaranteed () -> ()
 // CHECK: return
 // CHECK: }
 
-// CHECK-LABEL: sil shared [serializable] [thunk] @_T025inlineable_attribute_objc5HorseC6gallopyyFTc : $@convention(thin) (@owned Horse) -> @owned @callee_owned () -> ()
-// CHECK:   %1 = function_ref @_T025inlineable_attribute_objc5HorseC6gallopyyFTD
+// CHECK-LABEL: sil shared [serializable] [thunk] @$S25inlineable_attribute_objc5HorseC6gallopyyFTc : $@convention(thin) (@guaranteed Horse) -> @owned @callee_guaranteed () -> ()
+// CHECK:   %1 = function_ref @$S25inlineable_attribute_objc5HorseC6gallopyyFTD
 // CHECK: return
 // CHECK: }
 
-// CHECK-LABEL: sil shared [transparent] [serializable] [thunk] @_T025inlineable_attribute_objc5HorseC6gallopyyFTD : $@convention(method) (@guaranteed Horse) -> ()
-// CHECK: class_method [volatile]
+// CHECK-LABEL: sil shared [transparent] [serializable] [thunk] @$S25inlineable_attribute_objc5HorseC6gallopyyFTD : $@convention(method) (@guaranteed Horse) -> ()
+// CHECK: objc_method
 // CHECK: return
 // CHECK: }
 

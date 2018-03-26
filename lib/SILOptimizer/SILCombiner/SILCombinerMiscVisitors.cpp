@@ -28,9 +28,16 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/CommandLine.h"
 
 using namespace swift;
 using namespace swift::PatternMatch;
+
+/// This flag is used to disable alloc stack optimizations to ease testing of
+/// other SILCombine optimizations.
+static llvm::cl::opt<bool>
+    DisableAllocStackOpts("sil-combine-disable-alloc-stack-opts",
+                          llvm::cl::init(false));
 
 SILInstruction*
 SILCombiner::visitAllocExistentialBoxInst(AllocExistentialBoxInst *AEBI) {
@@ -334,6 +341,11 @@ public:
 } // end anonymous namespace
 
 SILInstruction *SILCombiner::visitAllocStackInst(AllocStackInst *AS) {
+  // If we are testing SILCombine and we are asked not to eliminate
+  // alloc_stacks, just return.
+  if (DisableAllocStackOpts)
+    return nullptr;
+
   AllocStackAnalyzer Analyzer(AS);
   Analyzer.analyze();
 
@@ -419,7 +431,7 @@ SILInstruction *SILCombiner::visitAllocStackInst(AllocStackInst *AS) {
 
   // Erase the 'live-range'
   for (auto *Inst : ToDelete) {
-    Inst->replaceAllUsesWithUndef();
+    Inst->replaceAllUsesOfAllResultsWithUndef();
     eraseInstFromFunction(*Inst);
   }
   return eraseInstFromFunction(*AS);
@@ -435,7 +447,8 @@ SILInstruction *SILCombiner::visitAllocRefInst(AllocRefInst *AR) {
     auto *Op = *UI;
     ++UI;
     auto *User = Op->getUser();
-    if (!isa<DeallocRefInst>(User) && !isa<SetDeallocatingInst>(User)) {
+    if (!isa<DeallocRefInst>(User) && !isa<SetDeallocatingInst>(User) &&
+        !isa<FixLifetimeInst>(User)) {
       HasNonRemovableUses = true;
       break;
     }
@@ -464,11 +477,18 @@ SILInstruction *SILCombiner::visitLoadInst(LoadInst *LI) {
   // Given a load with multiple struct_extracts/tuple_extracts and no other
   // uses, canonicalize the load into several (struct_element_addr (load))
   // pairs.
-  using ProjInstPairTy = std::pair<Projection, SILInstruction *>;
+
+  struct ProjInstPair {
+    Projection P;
+    SingleValueInstruction *I;
+
+    // When sorting, just look at the projection and ignore the instruction.
+    bool operator<(const ProjInstPair &RHS) const { return P < RHS.P; }
+  };
 
   // Go through the loads uses and add any users that are projections to the
   // projection list.
-  llvm::SmallVector<ProjInstPairTy, 8> Projections;
+  llvm::SmallVector<ProjInstPair, 8> Projections;
   for (auto *UI : getNonDebugUses(LI)) {
     auto *User = UI->getUser();
 
@@ -476,7 +496,8 @@ SILInstruction *SILCombiner::visitLoadInst(LoadInst *LI) {
     if (!isa<StructExtractInst>(User) && !isa<TupleExtractInst>(User))
       return nullptr;
 
-    Projections.push_back({Projection(User), User});
+    auto extract = cast<SingleValueInstruction>(User);
+    Projections.push_back({Projection(extract), extract});
   }
 
   // The reason why we sort the list is so that we will process projections with
@@ -489,8 +510,8 @@ SILInstruction *SILCombiner::visitLoadInst(LoadInst *LI) {
   Projection *LastProj = nullptr;
   LoadInst *LastNewLoad = nullptr;
   for (auto &Pair : Projections) {
-    auto &Proj = Pair.first;
-    auto *Inst = Pair.second;
+    auto &Proj = Pair.P;
+    auto *Inst = Pair.I;
 
     // If this projection is the same as the last projection we processed, just
     // replace all uses of the projection with the load we created previously.
@@ -654,7 +675,7 @@ SILInstruction *SILCombiner::visitCondFailInst(CondFailInst *CFI) {
 
   for (auto *Inst : ToRemove) {
     // Replace any still-remaining uses with undef and erase.
-    Inst->replaceAllUsesWithUndef();
+    Inst->replaceAllUsesOfAllResultsWithUndef();
     eraseInstFromFunction(*Inst);
   }
 
@@ -665,14 +686,41 @@ SILInstruction *SILCombiner::visitCondFailInst(CondFailInst *CFI) {
   return nullptr;
 }
 
+static bool isValueToBridgeObjectremovable(ValueToBridgeObjectInst *VTBOI) {
+  SILValue operand = VTBOI->getOperand();
+  // If operand is a struct $UInt (% : $Builtin.), fetch the real source
+  if (auto *SI = dyn_cast<StructInst>(operand)) {
+    assert(SI->SILInstruction::getAllOperands().size() == 1 &&
+           "Expected a single operand");
+    operand = SI->getOperand(0);
+  }
+  if (auto *BI = dyn_cast<BuiltinInst>(operand)) {
+    return (BI->getBuiltinInfo().ID == BuiltinValueKind::StringObjectOr);
+  }
+  return false;
+}
+
 SILInstruction *SILCombiner::visitStrongRetainInst(StrongRetainInst *SRI) {
   // Retain of ThinToThickFunction is a no-op.
-  if (isa<ThinToThickFunctionInst>(SRI->getOperand()))
+  SILValue funcOper = SRI->getOperand();
+  if (auto *CFI = dyn_cast<ConvertFunctionInst>(funcOper))
+    funcOper = CFI->getOperand();
+
+  if (isa<ThinToThickFunctionInst>(funcOper))
     return eraseInstFromFunction(*SRI);
 
   if (isa<ObjCExistentialMetatypeToObjectInst>(SRI->getOperand()) ||
       isa<ObjCMetatypeToObjectInst>(SRI->getOperand()))
     return eraseInstFromFunction(*SRI);
+
+  // Retain and Release of tagged strings is a no-op.
+  // The builtin code pattern to find tagged strings is:
+  // builtin "stringObjectOr_Int64" (or to tag the string)
+  // value_to_bridge_object (cast the UInt to bridge object)
+  if (auto *VTBOI = dyn_cast<ValueToBridgeObjectInst>(SRI->getOperand())) {
+    if (isValueToBridgeObjectremovable(VTBOI))
+      return eraseInstFromFunction(*SRI);
+  }
 
   // Sometimes in the stdlib due to hand offs, we will see code like:
   //
@@ -848,7 +896,7 @@ SILCombiner::visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI) {
 
   // If the enum does not have a payload create the enum/store since we don't
   // need to worry about payloads.
-  if (!IEAI->getElement()->getArgumentInterfaceType()) {
+  if (!IEAI->getElement()->hasAssociatedValues()) {
     EnumInst *E =
       Builder.createEnum(IEAI->getLoc(), SILValue(), IEAI->getElement(),
                           IEAI->getOperand()->getType().getObjectType());
@@ -1042,7 +1090,7 @@ visitUnreachableInst(UnreachableInst *UI) {
 
   for (auto *Inst : ToRemove) {
     // Replace any still-remaining uses with undef values and erase.
-    Inst->replaceAllUsesWithUndef();
+    Inst->replaceAllUsesOfAllResultsWithUndef();
     eraseInstFromFunction(*Inst);
   }
 
@@ -1116,6 +1164,24 @@ SILInstruction *SILCombiner::visitStrongReleaseInst(StrongReleaseInst *SRI) {
       isa<ObjCMetatypeToObjectInst>(SRI->getOperand()))
     return eraseInstFromFunction(*SRI);
 
+  // Retain and Release of tagged strings is a no-op.
+  // The builtin code pattern to find tagged strings is:
+  // builtin "stringObjectOr_Int64" (or to tag the string)
+  // value_to_bridge_object (cast the UInt to bridge object)
+  if (auto *VTBOI = dyn_cast<ValueToBridgeObjectInst>(SRI->getOperand())) {
+    if (isValueToBridgeObjectremovable(VTBOI))
+      return eraseInstFromFunction(*SRI);
+  }
+
+  // Release of a classbound existential converted from a class is just a
+  // release of the class, squish the conversion.
+  if (auto ier = dyn_cast<InitExistentialRefInst>(SRI->getOperand()))
+    if (ier->hasOneUse()) {
+      SRI->setOperand(ier->getOperand());
+      eraseInstFromFunction(*ier);
+      return SRI;
+    }
+  
   return nullptr;
 }
 
@@ -1345,7 +1411,7 @@ visitAllocRefDynamicInst(AllocRefDynamicInst *ARDI) {
   if (auto *UC = dyn_cast<UpcastInst>(MDVal))
     MDVal = UC->getOperand();
 
-  SILInstruction *NewInst = nullptr;
+  SingleValueInstruction *NewInst = nullptr;
   if (auto *MI = dyn_cast<MetatypeInst>(MDVal)) {
     auto &Mod = ARDI->getModule();
     auto SILInstanceTy = MI->getType().getMetatypeInstanceType(Mod);
@@ -1385,6 +1451,61 @@ visitAllocRefDynamicInst(AllocRefDynamicInst *ARDI) {
 }
 
 SILInstruction *SILCombiner::visitEnumInst(EnumInst *EI) {
+  return nullptr;
+}
+
+SILInstruction *SILCombiner::visitMarkDependenceInst(MarkDependenceInst *MDI) {
+  // Simplify the base operand of a MarkDependenceInst to eliminate unnecessary
+  // instructions that aren't adding value.
+  //
+  // Conversions to Optional.Some(x) often happen here, this isn't important
+  // for us, we can just depend on 'x' directly.
+  if (auto eiBase = dyn_cast<EnumInst>(MDI->getBase())) {
+    if (eiBase->hasOperand() && eiBase->hasOneUse()) {
+      MDI->setBase(eiBase->getOperand());
+      eraseInstFromFunction(*eiBase);
+      return MDI;
+    }
+  }
+  
+  // Conversions from a class to AnyObject also happen a lot, we can just depend
+  // on the class reference.
+  if (auto ier = dyn_cast<InitExistentialRefInst>(MDI->getBase())) {
+    MDI->setBase(ier->getOperand());
+    if (ier->use_empty())
+      eraseInstFromFunction(*ier);
+    return MDI;
+  }
+
+  // Conversions from a class to AnyObject also happen a lot, we can just depend
+  // on the class reference.
+  if (auto oeri = dyn_cast<OpenExistentialRefInst>(MDI->getBase())) {
+    MDI->setBase(oeri->getOperand());
+    if (oeri->use_empty())
+      eraseInstFromFunction(*oeri);
+    return MDI;
+  }
+
+  return nullptr;
+}
+
+
+SILInstruction *SILCombiner::
+visitClassifyBridgeObjectInst(ClassifyBridgeObjectInst *CBOI) {
+  auto *URC = dyn_cast<UncheckedRefCastInst>(CBOI->getOperand());
+  if (!URC)
+    return nullptr;
+
+  auto type = URC->getOperand()->getType().getSwiftRValueType();
+  if (ClassDecl *cd = type->getClassOrBoundGenericClass()) {
+    if (!cd->isObjC()) {
+      auto int1Ty = SILType::getBuiltinIntegerType(1, Builder.getASTContext());
+      SILValue zero = Builder.createIntegerLiteral(CBOI->getLoc(),
+                                                   int1Ty, 0);
+      return Builder.createTuple(CBOI->getLoc(), { zero, zero });
+    }
+  }
+
   return nullptr;
 }
 

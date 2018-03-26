@@ -76,20 +76,17 @@ public:
     return (isFixedSize(expansion) && StorageSize.isZero());
   }
 
-  StackAddress allocateStack(IRGenFunction &IGF, SILType T, bool isEntryBlock,
+  StackAddress allocateStack(IRGenFunction &IGF, SILType T,
                              const llvm::Twine &name) const override;
   void deallocateStack(IRGenFunction &IGF, StackAddress addr, SILType T) const override;
-  void destroyStack(IRGenFunction &IGF, StackAddress addr, SILType T) const override;
+  void destroyStack(IRGenFunction &IGF, StackAddress addr, SILType T,
+                    bool isOutlined) const override;
 
   // We can give these reasonable default implementations.
 
-  void initializeWithTake(IRGenFunction &IGF, Address destAddr,
-                          Address srcAddr, SILType T) const override;
+  void initializeWithTake(IRGenFunction &IGF, Address destAddr, Address srcAddr,
+                          SILType T, bool isOutlined) const override;
 
-  std::pair<llvm::Value*, llvm::Value*>
-  getSizeAndAlignmentMask(IRGenFunction &IGF, SILType T) const override;
-  std::tuple<llvm::Value*,llvm::Value*,llvm::Value*>
-  getSizeAndAlignmentMaskAndStride(IRGenFunction &IGF, SILType T) const override;
   llvm::Value *getSize(IRGenFunction &IGF, SILType T) const override;
   llvm::Value *getAlignmentMask(IRGenFunction &IGF, SILType T) const override;
   llvm::Value *getStride(IRGenFunction &IGF, SILType T) const override;
@@ -229,9 +226,25 @@ public:
   /// Fixed-size types never need dynamic value witness table instantiation.
   void initializeMetadata(IRGenFunction &IGF,
                           llvm::Value *metadata,
-                          llvm::Value *vwtable,
+                          bool isVWTMutable,
                           SILType T) const override {}
-  
+
+  void collectArchetypeMetadata(
+      IRGenFunction &IGF,
+      llvm::MapVector<CanType, llvm::Value *> &typeToMetadataVec,
+      SILType T) const override {
+    return;
+  }
+
+  llvm::Value *getEnumTagSinglePayload(IRGenFunction &IGF,
+                                       llvm::Value *numEmptyCases,
+                                       Address enumAddr,
+                                       SILType T) const override;
+
+  void storeEnumTagSinglePayload(IRGenFunction &IGF, llvm::Value *whichCase,
+                                 llvm::Value *numEmptyCases, Address enumAddr,
+                                 SILType T) const override;
+
   static bool classof(const FixedTypeInfo *type) { return true; }
   static bool classof(const TypeInfo *type) { return type->isFixedSize(); }
 };

@@ -17,7 +17,7 @@
 #include <stdint.h>
 #include "llvm/Support/Allocator.h"
 
-#if defined(__FreeBSD__) || defined(__CYGWIN__)
+#if defined(__FreeBSD__) || defined(__CYGWIN__) || defined(__HAIKU__)
 #include <stdio.h>
 #endif
 
@@ -126,6 +126,13 @@ template <class ElemTy> struct ConcurrentList {
   /// Points to the first link in the list.
   std::atomic<ConcurrentListNode<ElemTy> *> First;
 };
+
+/// A utility function for ordering two integers, which is useful
+/// for implementing compareWithKey.
+template <class T>
+static inline int compareIntegers(T left, T right) {
+  return (left == right ? 0 : left < right ? -1 : 1);
+}
 
 /// A utility function for ordering two pointers, which is useful
 /// for implementing compareWithKey.

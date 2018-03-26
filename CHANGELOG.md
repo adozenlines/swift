@@ -6,6 +6,8 @@ CHANGELOG
 
 | Contents               |
 | :--------------------- |
+| [Swift 4.2](#swift-42) |
+| [Swift 4.1](#swift-41) |
 | [Swift 4.0](#swift-40) |
 | [Swift 3.1](#swift-31) |
 | [Swift 3.0](#swift-30) |
@@ -18,8 +20,263 @@ CHANGELOG
 
 </details>
 
+Swift 4.2
+---------
+
+* [SE-0196][]
+  
+  Custom compile-time warnings or error messages can be emitted using the
+  `#warning(_:)` and `#error(_:)` directives.
+
+  ```swift
+  #warning("this is incomplete")
+
+  #if MY_BUILD_CONFIG && MY_OTHER_BUILD_CONFIG
+    #error("MY_BUILD_CONFIG and MY_OTHER_BUILD_CONFIG cannot both be set")
+  #endif
+  ```
+
+* Public classes may now have internal `required` initializers. The rule for
+  `required` initializers is that they must be available everywhere the class
+  can be subclassed, but previously we said that `required` initializers on
+  public classes needed to be public themselves. (This limitation is a holdover
+  from before the introduction of the open/public distinction in Swift 3.)
+
+* C macros containing casts are no longer imported to Swift if the type in the
+  cast is unavailable or deprecated, or produces some other diagnostic when
+  referenced. (These macros were already only imported under very limited
+  circumstances with very simple values, so this is unlikely to affect
+  real-world code.)
+
+* [SE-0143][]
+
+	Runtime query of conditional conformances is now implemented. Therefore,
+	a dynamic cast such as `value as? P`, where the dynamic type of `value`
+	conditionally conforms to `P`, will succeed when the conditional
+	requirements are met.
+
+**Add new entries to the top of this file, not here!**
+
+Swift 4.1
+---------
+
+* [SE-0075][]
+
+  Compile-time testing for the existence and importability of modules is now
+  implemented as a build configuration test.  The `canImport` test allows
+  the development of features that require a possibly-failing import 
+  declaration across multiple platforms.  
+
+  ```swift
+  #if canImport(UIKit)
+    import UIKit
+    class MyView : UIView {}
+  #elseif canImport(AppKit)
+    import AppKit
+    class MyView : NSView {}
+  #else
+    class MyView : CustomView {}
+  #endif
+  ```
+
+* [SE-0189][]
+
+  If an initializer is declared in a different module from a struct, it must
+  use `self.init(…)` or `self = …` before returning or accessing `self`.
+  Failure to do so will produce a warning in Swift 4 and an error in Swift 5.
+  This is to keep a client app from accidentally depending on a library's
+  implementation details, and matches an existing restriction for classes,
+  where cross-module initializers must be convenience initializers.
+
+  This will most commonly affect code that extends a struct imported from C.
+  However, most imported C structs are given a zeroing no-argument initializer,
+  which can be called as `self.init()` before modifying specific properties.
+
+  Swift library authors who wish to continue allowing initialization on a
+  per-member basis should explicitly declare a public memberwise initializer
+  for clients in other modules to use.
+
+* [SE-0166][] / [SE-0143][]
+
+  The standard library now defines the conformances of `Optional`,
+  `Array`, `Dictionary`, and `Set` to `Encodable` and `Decodable` as
+  conditional conformances, available only when their type parameters
+  conform to `Encodable` or `Decodable`, respectively.
+
+* [SE-0188][] 
+  
+  Index types for most standard library collections now conform to `Hashable`. 
+  These indices can now be used in key-path subscripts and hashed collections:
+  
+  ```swift
+  let s = "Hashable"
+  let p = \String.[s.startIndex]
+  s[keyPath: p] // "H"
+  ```
+
+* [SE-0143][] The standard library types `Optional`, `Array`, and
+	`Dictionary` now conform to the `Equatable` protocol when their element types
+	conform to `Equatable`. This allows the `==` operator to compose (e.g., one
+	can compare two values of type `[Int : [Int?]?]` with `==`), as well as use
+  various algorthims defined for `Equatable` element types, such as
+	`index(of:)`.
+
+* [SE-0157][] is implemented. Associated types can now declare "recursive"
+	constraints, which require that the associated type conform to the enclosing
+	protocol. The standard library protocols have been updated to make use of
+	recursive constraints. For example, the `SubSequence` associated type of
+	`Sequence` follows the enclosing protocol:
+
+  ```swift
+  protocol Sequence {
+    associatedtype Element
+    associatedtype SubSequence: Sequence
+      where SubSequence.Element == Element,
+            SubSequence.SubSequence == SubSequence
+    // ...
+  }
+
+  protocol Collection: Sequence where Self.SubSequence: Collection {
+    // ...
+  }
+  ```
+
+  As a result, a number of new constraints have been introduced into the
+	standard library protocols:
+
+	* Make the `Indices` associated type have the same traversal requirements as
+	its enclosing protocol, e.g., `Collection.Indices` conforms to
+	`Collection`, `BidirectionalCollection.Indices` conforms to
+	`BidirectionalCollection`, and so on
+	* Make `Numeric.Magnitude` conform to `Numeric`
+	* Use more efficient `SubSequence` types for lazy filter and map
+	* Eliminate the `*Indexable` protocols
+
+
+* [SE-0161][] is fully implemented. KeyPaths now support subscript, optional
+  chaining, and optional force-unwrapping components.
+
+* [SE-0186][]
+
+  It is no longer valid to use the ownership keywords `weak` and `unowned` for property declarations in protocols. These keywords are meaningless and misleading when used in a protocol as they don't have any effect.
+
+  In Swift 3 and 4 mode the following example will produce a warning with a fix-it to remove the keyword. In Swift 5 mode and above an error will be produced.
+
+  ```swift
+  class A {}
+
+  protocol P {
+      weak var weakVar: A? { get set }
+      unowned var unownedVar: A { get set }
+  }
+  ```
+
+* [SE-0185][]
+
+  Structs and enums that declare a conformance to `Equatable`/`Hashable` now get an automatically synthesized implementation of `==`/`hashValue`. For structs, all stored properties must be `Equatable`/`Hashable`. For enums, all enum cases with associated values must be `Equatable`/`Hashable`.
+
+  ```swift
+  public struct Point: Hashable {
+    public let x: Int
+    public let y: Int
+
+    public init(x: Int, y: Int) {
+      self.x = x
+      self.y = y
+    }
+  }
+
+  Point(3, 0) == Point(0, 3)  // false
+  Point(3, 0) == Point(3, 0)  // true
+  Point(3, 0).hashValue       // -2942920663782199421
+
+  public enum Token: Hashable {
+    case comma
+    case identifier(String)
+    case number(Int)
+  }
+
+  Token.identifier("x") == .number(5)        // false
+  Token.identifier("x") == .identifier("x")  // true
+  Token.number(50).hashValue                 // -2002318238093721609
+  ```
+
+  If you wish to provide your own implementation of `==`/`hashValue`, you still can; a custom implementation will replace the one synthesized by the compiler.
+
 Swift 4.0
 ---------
+
+### 2017-09-19 (Xcode 9.0)
+
+* [SE-0165][] and [SE-0154][]
+
+  The standard library's `Dictionary` and `Set` types have some new features. You can now create a new dictionary from a sequence of keys and values, and merge keys and values into an existing dictionary.
+
+  ```swift
+  let asciiTable = Dictionary(uniqueKeysWithValues: zip("abcdefghijklmnopqrstuvwxyz", 97...))
+  // ["w": 119, "n": 110, "u": 117, "v": 118, "x": 120, "q": 113, ...]
+
+  let vegetables = ["tomato", "carrot", "onion", "onion", "carrot", "onion"]
+  var vegetableCounts = Dictionary(zip(vegetables, repeatElement(1, count: Int.max)),
+                                   uniquingKeysWith: +)
+  vegetableCounts.merge([("tomato", 1)], uniquingKeysWith: +)
+  // ["tomato": 2, "carrot": 2, "onion": 3]
+  ```
+
+  Filtering a set or a dictionary now results in the same type. You can also now transform just the values of a dictionary, keeping the same keys, using the `mapValues(_:)` method.
+
+  ```swift
+  let vowels: Set<Character> = ["a", "e", "i", "o", "u"]
+  let asciiVowels = asciiTable.filter({ vowels.contains($0.key) })
+  asciiVowels["a"]  // 97
+  asciiVowels["b"]  // nil
+
+  let asciiHexTable = asciiTable.mapValues({ "0x" + String($0, radix: 16) })
+  // ["w": "0x77", "n": "0x6e", "u": "0x75", "v": "0x76", "x": "0x78", ...]
+  ```
+
+  When using a key as a dictionary subscript, you can now supply a default value to be returned if the key is not present in the dictionary.
+
+  ```swift
+  for veg in ["tomato", "cauliflower"] {
+      vegetableCounts[veg, default: 0] += 1
+  }
+  // ["tomato": 3, "carrot": 2, "onion": 3, "cauliflower": 1]
+  ```
+
+  Use the new `init(grouping:by:)` initializer to convert an array or other sequence into a dictionary, grouped by a particular trait.
+
+  ```swift
+  let buttons = // an array of button instances
+  let buttonsByStatus = Dictionary(grouping: buttons, by: { $0.isEnabled })
+  // How many enabled buttons?
+  print("Enabled:", buttonsByStatus[true]?.count ?? 0)
+  ```
+
+  Additionally, dictionaries and sets now have a visible `capacity` property and a `reserveCapacity(_:)` method similar to arrays, and a dictionary's `keys` and `values` properties are represented by specialized collections.
+
+* [SE-0161][] is partially implemented. Swift now natively supports key path
+  objects for properties. Similar to KVC key path strings in Cocoa, key path
+  objects allow a property to be referenced independently of accessing it
+  from a value:
+
+    ```swift
+    struct Point {
+      var x, y: Double
+    }
+    let x = \Point.x
+    let y = \Point.y
+
+    let p = Point(x: 3, y: 4)
+    p[keyPath: x] // gives 3
+    p[keyPath: y] // gives 4
+    ```
+
+* Core Foundation types implicitly conform to Hashable (and Equatable), using
+  CFHash and CFEqual as the implementation. This change applies even to "Swift
+  3 mode", so if you were previously adding this conformance yourself, use
+  `#if swift(>=3.2)` to restrict the extension to Swift 3.1 and below.
+  ([SR-2388](https://bugs.swift.org/browse/SR-2388))
 
 * [SE-0156][]
 
@@ -234,8 +491,6 @@ Swift 4.0
   #define TINY    (BITWIDTH <= 16)
   #define LIMITED (SMALL || TINY)   // now imported as Bool.
   ```
-
-  **Add new entries to the top of this file, not here!**
 
 Swift 3.1
 ---------
@@ -6630,3 +6885,33 @@ Swift 1.0
 [SE-0167]: <https://github.com/apple/swift-evolution/blob/master/proposals/0167-swift-encoders.md>
 [SE-0168]: <https://github.com/apple/swift-evolution/blob/master/proposals/0168-multi-line-string-literals.md>
 [SE-0169]: <https://github.com/apple/swift-evolution/blob/master/proposals/0169-improve-interaction-between-private-declarations-and-extensions.md>
+[SE-0170]: <https://github.com/apple/swift-evolution/blob/master/proposals/0170-nsnumber_bridge.md>
+[SE-0171]: <https://github.com/apple/swift-evolution/blob/master/proposals/0171-reduce-with-inout.md>
+[SE-0172]: <https://github.com/apple/swift-evolution/blob/master/proposals/0172-one-sided-ranges.md>
+[SE-0173]: <https://github.com/apple/swift-evolution/blob/master/proposals/0173-swap-indices.md>
+[SE-0174]: <https://github.com/apple/swift-evolution/blob/master/proposals/0174-filter-range-replaceable.md>
+[SE-0175]: <https://github.com/apple/swift-evolution/blob/master/proposals/0175-package-manager-revised-dependency-resolution.md>
+[SE-0176]: <https://github.com/apple/swift-evolution/blob/master/proposals/0176-enforce-exclusive-access-to-memory.md>
+[SE-0177]: <https://github.com/apple/swift-evolution/blob/master/proposals/0177-add-clamped-to-method.md>
+[SE-0178]: <https://github.com/apple/swift-evolution/blob/master/proposals/0178-character-unicode-view.md>
+[SE-0179]: <https://github.com/apple/swift-evolution/blob/master/proposals/0179-swift-run-command.md>
+[SE-0180]: <https://github.com/apple/swift-evolution/blob/master/proposals/0180-string-index-overhaul.md>
+[SE-0181]: <https://github.com/apple/swift-evolution/blob/master/proposals/0181-package-manager-cpp-language-version.md>
+[SE-0182]: <https://github.com/apple/swift-evolution/blob/master/proposals/0182-newline-escape-in-strings.md>
+[SE-0183]: <https://github.com/apple/swift-evolution/blob/master/proposals/0183-substring-affordances.md>
+[SE-0184]: <https://github.com/apple/swift-evolution/blob/master/proposals/0184-unsafe-pointers-add-missing.md>
+[SE-0185]: <https://github.com/apple/swift-evolution/blob/master/proposals/0185-synthesize-equatable-hashable.md>
+[SE-0186]: <https://github.com/apple/swift-evolution/blob/master/proposals/0186-remove-ownership-keyword-support-in-protocols.md>
+[SE-0187]: <https://github.com/apple/swift-evolution/blob/master/proposals/0187-introduce-filtermap.md>
+[SE-0188]: <https://github.com/apple/swift-evolution/blob/master/proposals/0188-stdlib-index-types-hashable.md>
+[SE-0189]: <https://github.com/apple/swift-evolution/blob/master/proposals/0189-restrict-cross-module-struct-initializers.md>
+[SE-0190]: <https://github.com/apple/swift-evolution/blob/master/proposals/0190-target-environment-platform-condition.md>
+[SE-0191]: <https://github.com/apple/swift-evolution/blob/master/proposals/0191-eliminate-indexdistance.md>
+[SE-0192]: <https://github.com/apple/swift-evolution/blob/master/proposals/0192-non-exhaustive-enums.md>
+[SE-0193]: <https://github.com/apple/swift-evolution/blob/master/proposals/0193-cross-module-inlining-and-specialization.md>
+[SE-0194]: <https://github.com/apple/swift-evolution/blob/master/proposals/0194-derived-collection-of-enum-cases.md>
+[SE-0195]: <https://github.com/apple/swift-evolution/blob/master/proposals/0195-dynamic-member-lookup.md>
+[SE-0196]: <https://github.com/apple/swift-evolution/blob/master/proposals/0196-diagnostic-directives.md>
+[SE-0197]: <https://github.com/apple/swift-evolution/blob/master/proposals/0197-remove-where.md>
+[SE-0198]: <https://github.com/apple/swift-evolution/blob/master/proposals/0198-playground-quicklook-api-revamp.md>
+[SE-0199]: <https://github.com/apple/swift-evolution/blob/master/proposals/0199-bool-toggle.md>

@@ -44,7 +44,9 @@ class Pattern;
 class ProtocolConformance;
 
 /// A serialized module, along with the tools to access it.
-class ModuleFile : public LazyMemberLoader {
+class ModuleFile
+  : public LazyMemberLoader,
+    public LazyConformanceLoader {
   friend class SerializedASTFile;
   friend class SILDeserializer;
   using Status = serialization::Status;
@@ -64,6 +66,7 @@ class ModuleFile : public LazyMemberLoader {
 
   llvm::BitstreamCursor SILCursor;
   llvm::BitstreamCursor SILIndexCursor;
+  llvm::BitstreamCursor DeclMemberTablesCursor;
 
   /// The name of the module.
   StringRef Name;
@@ -73,7 +76,7 @@ class ModuleFile : public LazyMemberLoader {
   StringRef TargetTriple;
 
   /// The Swift compatibility version in use when this module was built.
-  StringRef CompatibilityVersion;
+  version::Version CompatibilityVersion;
 
   /// The data blob containing all of the module's identifiers.
   StringRef IdentifierData;
@@ -84,16 +87,10 @@ class ModuleFile : public LazyMemberLoader {
   /// The number of entities that are currently being deserialized.
   unsigned NumCurrentDeserializingEntities = 0;
 
-  /// Declaration contexts with delayed generic environments, which will be
-  /// completed as a pending action.
-  ///
-  /// This should only be used on the module returned by
-  /// getModuleFileForDelayedActions().
-  ///
-  /// FIXME: This is needed because completing a generic environment can
-  /// require the type checker, which might be gone if we delay generic
-  /// environments too far. It is a hack.
-  std::vector<DeclContext *> DelayedGenericEnvironments;
+  /// Is this module file actually a .sib file? .sib files are serialized SIL at
+  /// arbitrary granularity and arbitrary stage; unlike serialized Swift
+  /// modules, which are assumed to contain canonical SIL for an entire module.
+  bool IsSIB = false;
 
   /// RAII class to be used when deserializing an entity.
   class DeserializingEntityRAII {
@@ -307,6 +304,9 @@ private:
   /// Types referenced by this module.
   std::vector<Serialized<Type>> Types;
 
+  /// Generic signatures referenced by this module.
+  std::vector<Serialized<GenericSignature *>> GenericSignatures;
+
   /// Generic environments referenced by this module.
   std::vector<Serialized<GenericEnvironment *>> GenericEnvironments;
 
@@ -344,14 +344,26 @@ private:
   using SerializedNestedTypeDeclsTable =
       llvm::OnDiskIterableChainedHashTable<NestedTypeDeclsTableInfo>;
 
+  class DeclMemberNamesTableInfo;
+  using SerializedDeclMemberNamesTable =
+      llvm::OnDiskIterableChainedHashTable<DeclMemberNamesTableInfo>;
+
+  class DeclMembersTableInfo;
+  using SerializedDeclMembersTable =
+      llvm::OnDiskIterableChainedHashTable<DeclMembersTableInfo>;
+
   std::unique_ptr<SerializedDeclTable> TopLevelDecls;
   std::unique_ptr<SerializedDeclTable> OperatorDecls;
   std::unique_ptr<SerializedDeclTable> PrecedenceGroupDecls;
-  std::unique_ptr<SerializedDeclTable> ClassMembersByName;
+  std::unique_ptr<SerializedDeclTable> ClassMembersForDynamicLookup;
   std::unique_ptr<SerializedDeclTable> OperatorMethodDecls;
   std::unique_ptr<SerializedExtensionTable> ExtensionDecls;
   std::unique_ptr<SerializedLocalDeclTable> LocalTypeDecls;
   std::unique_ptr<SerializedNestedTypeDeclsTable> NestedTypeDecls;
+  std::unique_ptr<SerializedDeclMemberNamesTable> DeclMemberNames;
+
+  llvm::DenseMap<uint32_t,
+           std::unique_ptr<SerializedDeclMembersTable>> DeclMembersTables;
 
   class ObjCMethodTableInfo;
   using SerializedObjCMethodTable =
@@ -443,7 +455,7 @@ public:
 
   /// Emits one last diagnostic, logs the error, and then aborts for the stack
   /// trace.
-  void fatal(llvm::Error error) LLVM_ATTRIBUTE_NORETURN;
+  LLVM_ATTRIBUTE_NORETURN void fatal(llvm::Error error);
 
   ASTContext &getContext() const {
     assert(FileContext && "no associated context yet");
@@ -485,6 +497,21 @@ private:
   /// index_block::NestedTypeDeclsLayout format.
   std::unique_ptr<SerializedNestedTypeDeclsTable>
   readNestedTypeDeclsTable(ArrayRef<uint64_t> fields, StringRef blobData);
+
+  /// Read an on-disk local decl-name hash table stored in
+  /// index_block::DeclMemberNamesLayout format.
+  std::unique_ptr<SerializedDeclMemberNamesTable>
+  readDeclMemberNamesTable(ArrayRef<uint64_t> fields, StringRef blobData);
+
+  /// Read an on-disk local decl-members hash table stored in
+  /// index_block::DeclMembersLayout format.
+  std::unique_ptr<SerializedDeclMembersTable>
+  readDeclMembersTable(ArrayRef<uint64_t> fields, StringRef blobData);
+
+  /// Main logic of getDeclChecked.
+  llvm::Expected<Decl *>
+  getDeclCheckedImpl(serialization::DeclID DID,
+                     Optional<DeclContext *> ForcedContext = None);
 
   /// Reads the index block, which contains global tables.
   ///
@@ -614,7 +641,7 @@ public:
 
   /// Searches the module's nested type decls table for the given member of
   /// the given type.
-  TypeDecl *lookupNestedType(Identifier name, const ValueDecl *parent);
+  TypeDecl *lookupNestedType(Identifier name, const NominalTypeDecl *parent);
 
   /// Searches the module's operators for one with the given name and fixity.
   ///
@@ -709,6 +736,11 @@ public:
   virtual void loadAllMembers(Decl *D,
                               uint64_t contextData) override;
 
+  virtual
+  Optional<TinyPtrVector<ValueDecl *>>
+  loadNamedMembers(const IterableDeclContext *IDC, DeclBaseName N,
+                   uint64_t contextData) override;
+
   virtual void
   loadAllConformances(const Decl *D, uint64_t contextData,
                     SmallVectorImpl<ProtocolConformance*> &Conforms) override;
@@ -751,7 +783,11 @@ public:
   /// Returns the type with the given ID, deserializing it if needed.
   llvm::Expected<Type> getTypeChecked(serialization::TypeID TID);
 
-  /// Returns the identifier with the given ID, deserializing it if needed.
+  /// Returns the base name with the given ID, deserializing it if needed.
+  DeclBaseName getDeclBaseName(serialization::IdentifierID IID);
+
+  /// Convenience method to retrieve the identifier backing the name with
+  /// given ID. Asserts that the name with this ID is not special.
   Identifier getIdentifier(serialization::IdentifierID IID);
 
   /// Returns the decl with the given ID, deserializing it if needed.
@@ -789,6 +825,9 @@ public:
   /// If the name matches the name of the current module, a shadowed module
   /// is loaded instead.
   ModuleDecl *getModule(ArrayRef<Identifier> name);
+
+  /// Returns the generic signature for the given ID.
+  GenericSignature *getGenericSignature(serialization::GenericSignatureID ID);
 
   /// Returns the generic signature or environment for the given ID,
   /// deserializing it if needed.

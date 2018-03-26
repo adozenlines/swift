@@ -1,4 +1,4 @@
-//===--- StringUTF8.swift - A UTF8 view of _StringCore --------------------===//
+//===--- StringUTF8.swift - A UTF8 view of String -------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -9,87 +9,6 @@
 // See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
-//
-//  _StringCore currently has three representations: Native ASCII,
-//  Native UTF-16, and Opaque Cocoa.  Expose each of these as UTF-8 in a
-//  way that will hopefully be efficient to traverse
-//
-//===----------------------------------------------------------------------===//
-
-// FIXME(ABI)#72 : The UTF-8 string view should conform to
-// `BidirectionalCollection`.
-
-// FIXME(ABI)#73 : The UTF-8 string view should have a custom iterator type to
-// allow performance optimizations of linear traversals.
-
-extension _StringCore {
-  /// An integral type that holds a sequence of UTF-8 code units, starting in
-  /// its low byte.
-  internal typealias _UTF8Chunk = UInt64
-
-  /// Encode text starting at `i` as UTF-8.  Returns a pair whose first
-  /// element is the index of the text following whatever got encoded,
-  /// and the second element contains the encoded UTF-8 starting in its
-  /// low byte.  Any unused high bytes in the result will be set to
-  /// 0xFF.
-  @inline(__always)
-  func _encodeSomeUTF8(from i: Int) -> (Int, _UTF8Chunk) {
-    _sanityCheck(i <= count)
-
-    if let asciiBuffer = self.asciiBuffer {
-      // How many UTF-16 code units might we use before we've filled up
-      // our _UTF8Chunk with UTF-8 code units?
-      let utf16Count =
-        Swift.min(MemoryLayout<_UTF8Chunk>.size, asciiBuffer.count - i)
-
-      var result: _UTF8Chunk = ~0 // Start with all bits set
-
-      _memcpy(
-        dest: UnsafeMutableRawPointer(Builtin.addressof(&result)),
-        src: asciiBuffer.baseAddress! + i,
-        size: numericCast(utf16Count))
-
-      // Convert the _UTF8Chunk into host endianness.
-      return (i + utf16Count, _UTF8Chunk(littleEndian: result))
-    } else if _fastPath(_baseAddress != nil) {
-      // Transcoding should return a _UTF8Chunk in host endianness.
-      return _encodeSomeContiguousUTF16AsUTF8(from: i)
-    } else {
-#if _runtime(_ObjC)
-      return _encodeSomeNonContiguousUTF16AsUTF8(from: i)
-#else
-      _sanityCheckFailure("_encodeSomeUTF8: Unexpected cocoa string")
-#endif
-    }
-  }
-
-  /// Helper for `_encodeSomeUTF8`, above.  Handles the case where the
-  /// storage is contiguous UTF-16.
-  func _encodeSomeContiguousUTF16AsUTF8(from i: Int) -> (Int, _UTF8Chunk) {
-    _sanityCheck(elementWidth == 2)
-    _sanityCheck(_baseAddress != nil)
-
-    let storage = UnsafeBufferPointer(start: startUTF16, count: self.count)
-    return _transcodeSomeUTF16AsUTF8(storage, i)
-  }
-
-#if _runtime(_ObjC)
-  /// Helper for `_encodeSomeUTF8`, above.  Handles the case where the
-  /// storage is non-contiguous UTF-16.
-  func _encodeSomeNonContiguousUTF16AsUTF8(from i: Int) -> (Int, _UTF8Chunk) {
-    _sanityCheck(elementWidth == 2)
-    _sanityCheck(_baseAddress == nil)
-
-    let storage = _CollectionOf<Int, UInt16>(
-      _startIndex: 0, endIndex: self.count
-    ) {
-      (i: Int) -> UInt16 in
-      return _cocoaStringSubscript(self, i)
-    }
-    return _transcodeSomeUTF16AsUTF8(storage, i)
-  }
-#endif
-}
 
 extension String {
   /// A view of a string's contents as a collection of UTF-8 code units.
@@ -166,174 +85,208 @@ extension String {
   ///     // Prints "-17"
   ///     print(String(s1.utf8.prefix(15)))
   ///     // Prints "They call me 'B"
+  @_fixed_layout // FIXME(sil-serialize-all)
   public struct UTF8View
-    : Collection, 
-      CustomStringConvertible, 
+    : BidirectionalCollection,
+      CustomStringConvertible,
       CustomDebugStringConvertible {
-    internal let _core: _StringCore
-    internal let _startIndex: Index
-    internal let _endIndex: Index
 
-    init(_ _core: _StringCore) {
-      self._core = _core
-      self._endIndex = Index(_coreIndex: _core.endIndex, Index._emptyBuffer)
-      if _fastPath(_core.count != 0) {
-        let (_, buffer) = _core._encodeSomeUTF8(from: 0)
-        self._startIndex = Index(_coreIndex: 0, buffer)
-      } else {
-        self._startIndex = self._endIndex
-      }
-    }
+    /// Underlying UTF-16-compatible representation
+    @_versioned
+    internal var _guts: _StringGuts
 
-    init(_ _core: _StringCore, _ s: Index, _ e: Index) {
-      self._core = _core
-      self._startIndex = s
-      self._endIndex = e
-    }
-
-    /// A position in a string's `UTF8View` instance.
+    /// Distances to `(startIndex, endIndex)` from the endpoints of _guts,
+    /// measured in UTF-8 code units.
     ///
-    /// You can convert between indices of the different string views by using
-    /// conversion initializers and the `samePosition(in:)` method overloads.
-    /// For example, the following code sample finds the index of the first
-    /// space in the string's character view and then converts that to the same
-    /// position in the UTF-8 view.
+    /// Note: this is *only* here to support legacy Swift3-style slicing where
+    /// `s.utf8[i..<j]` produces a `String.UTF8View`, and should be removed when
+    /// those semantics are no longer supported.
+    @_versioned
+    internal let _legacyOffsets: (start: Int8, end: Int8)
+
+    /// Flags indicating whether the limits of this view did not originally fall
+    /// on grapheme cluster boundaries in the original string. This is used to
+    /// emulate (undocumented) Swift 3 behavior where String.init?(_:) returned
+    /// nil in such cases.
     ///
-    ///     let hearts = "Hearts <3 ♥︎ 💘"
-    ///     if let i = hearts.characters.index(of: " ") {
-    ///         let j = i.samePosition(in: hearts.utf8)
-    ///         print(Array(hearts.utf8.prefix(upTo: j)))
-    ///         print(hearts.utf8.prefix(upTo: j))
-    ///     }
-    ///     // Prints "[72, 101, 97, 114, 116, 115]"
-    ///     // Prints "Hearts"
-    public struct Index {
-      internal typealias Buffer = _StringCore._UTF8Chunk
+    /// Note: this is *only* here to support legacy Swift3-style slicing where
+    /// `s.utf8[i..<j]` produces a `String.UTF8View`, and should be removed when
+    /// those semantics are no longer supported.
+    @_versioned
+    internal let _legacyPartialCharacters: (start: Bool, end: Bool)
 
-      init(_coreIndex: Int, _ _buffer: Buffer) {
-        self._coreIndex = _coreIndex
-        self._buffer = _buffer
-      }
-
-      /// True iff the index is at the end of its view or if the next
-      /// byte begins a new UnicodeScalar.
-      internal func _isOnUnicodeScalarBoundary(in core: _StringCore) -> Bool {
-        let buffer = UInt32(extendingOrTruncating: _buffer)
-        let (codePoint, _) = UTF8._decodeOne(buffer)
-        return codePoint != nil || _isEndIndex(of: core)
-      }
-
-      /// True iff the index is at the end of its view
-      internal func _isEndIndex(of core: _StringCore) -> Bool {
-        return _buffer == Index._emptyBuffer
-          && _coreIndex == core.endIndex
-      }
-
-      /// The number of UTF-8 code units remaining in the buffer before the
-      /// next unicode scalar value is reached. This simulates calling
-      /// `index(after: i)` until `i._coreIndex` is incremented, but doesn't
-      /// need a `_core` reference.
-      internal var _utf8ContinuationBytesUntilNextUnicodeScalar: Int {
-        var buffer = _buffer
-        var count = 0
-        
-        while true {
-          let currentUnit = UTF8.CodeUnit(extendingOrTruncating: buffer)
-          if currentUnit & 0b1100_0000 != 0b1000_0000 {
-            break
-          }
-          count += 1
-          buffer = Index._nextBuffer(after: buffer)
-        }
-        return count
-      }
-
-      /// The value of the buffer when it is empty
-      internal static var _emptyBuffer: Buffer {
-        return ~0
-      }
-
-      /// A Buffer value with the high byte set
-      internal static var _bufferHiByte: Buffer {
-        return 0xFF &<< ((MemoryLayout<Buffer>.size &- 1) &* 8)
-      }
-      
-      /// Consume a byte of the given buffer: shift out the low byte
-      /// and put FF in the high byte
-      internal static func _nextBuffer(after thisBuffer: Buffer) -> Buffer {
-        return (thisBuffer &>> (8 as Buffer)) | _bufferHiByte
-      }
-
-      /// The position of `self`, rounded up to the nearest unicode
-      /// scalar boundary, in the underlying UTF-16.
-      internal let _coreIndex: Int
-      /// If `self` is at the end of its `_core`, has the value `_emptyBuffer`.
-      /// Otherwise, the low byte contains the value of the UTF-8 code unit
-      /// at this position.
-      internal let _buffer: Buffer
+    @_inlineable // FIXME(sil-serialize-all)
+    @_versioned // FIXME(sil-serialize-all)
+    internal init(
+      _ _guts: _StringGuts,
+      legacyOffsets: (Int, Int) = (0, 0),
+      legacyPartialCharacters: (Bool, Bool) = (false, false)
+    ) {
+      self._guts = _guts
+      self._legacyOffsets = (Int8(legacyOffsets.0), Int8(legacyOffsets.1))
+      self._legacyPartialCharacters = legacyPartialCharacters
     }
 
-    public typealias IndexDistance = Int
+    public typealias Index = String.Index
 
     /// The position of the first code unit if the UTF-8 view is
     /// nonempty.
     ///
     /// If the UTF-8 view is empty, `startIndex` is equal to `endIndex`.
+    @_inlineable // FIXME(sil-serialize-all)
     public var startIndex: Index {
-      return self._startIndex
+      let r = _index(atEncodedOffset: _guts.startIndex)
+      if _legacyOffsets.start == 0 { return r }
+      return index(r, offsetBy: numericCast(_legacyOffsets.start))
     }
 
     /// The "past the end" position---that is, the position one
     /// greater than the last valid subscript argument.
     ///
     /// In an empty UTF-8 view, `endIndex` is equal to `startIndex`.
+    @_inlineable // FIXME(sil-serialize-all)
     public var endIndex: Index {
-      return self._endIndex
+      _sanityCheck(_legacyOffsets.end >= -3 && _legacyOffsets.end <= 0,
+        "out of bounds legacy end")
+
+      var r = Index(encodedOffset: _guts.endIndex)
+      if _fastPath(_legacyOffsets.end == 0) {
+        return r
+      }
+      switch _legacyOffsets.end {
+      case -3: r = index(before: r); fallthrough
+      case -2: r = index(before: r); fallthrough
+      case -1: return index(before: r)
+      default: Builtin.unreachable()
+      }
+    }
+
+    @_inlineable // FIXME(sil-serialize-all)
+    @_versioned
+    internal func _index(atEncodedOffset n: Int) -> Index {
+      if _fastPath(_guts.isASCII) { return Index(encodedOffset: n) }
+      let count = _guts.count
+      if n == count { return endIndex }
+
+      var p = UTF16.ForwardParser()
+      var i = _guts.makeIterator(in: n..<count)
+      var buffer = Index._UTF8Buffer()
+    Loop:
+      while true {
+        switch p.parseScalar(from: &i) {
+        case .valid(let u16):
+          let u8 = Unicode.UTF8.transcode(u16, from: Unicode.UTF16.self)
+           ._unsafelyUnwrappedUnchecked
+          if buffer.count + u8.count > buffer.capacity { break Loop }
+          buffer.append(contentsOf: u8)
+        case .error:
+          let u8 = Unicode.UTF8.encodedReplacementCharacter
+          if buffer.count + u8.count > buffer.capacity { break Loop }
+          buffer.append(contentsOf: u8)
+        case .emptyInput:
+          break Loop
+        }
+      }
+      return Index(encodedOffset: n, .utf8(buffer: buffer))
     }
 
     /// Returns the next consecutive position after `i`.
     ///
     /// - Precondition: The next position is representable.
+    @_inlineable // FIXME(sil-serialize-all)
+    @inline(__always)
     public func index(after i: Index) -> Index {
-      // FIXME: swift-3-indexing-model: range check i?
-      let currentUnit = UTF8.CodeUnit(extendingOrTruncating: i._buffer)
-      let hiNibble = currentUnit &>> (4 as UTF8.CodeUnit)
-
-      // Amounts to increment the UTF-16 index based on the high nibble of a
-      // UTF-8 code unit. If the high nibble is:
-      //
-      // - 0b0000-0b0111: U+0000...U+007F: increment the UTF-16 pointer by 1
-      // - 0b1000-0b1011: UTF-8 continuation byte, do not increment 
-      //                  the UTF-16 pointer
-      // - 0b1100-0b1110: U+0080...U+FFFF: increment the UTF-16 pointer by 1
-      // - 0b1111:        U+10000...U+1FFFFF: increment the UTF-16 pointer by 2
-      let u16Increments = Int(bitPattern:
-      // 1111 1110 1101 1100 1011 1010 1001 1000 0111 0110 0101 0100 0011 0010 0001 0000
-         0b10___01___01___01___00___00___00___00___01___01___01___01___01___01___01___01)
-      
-      // Map the high nibble of the current code unit into the
-      // amount by which to increment the UTF-16 index.
-      let increment = (u16Increments &>>
-        Int(extendingOrTruncating: hiNibble &<< (1 as UTF8.CodeUnit))) & 0x3
-      let nextCoreIndex = i._coreIndex &+ increment
-      let nextBuffer = Index._nextBuffer(after: i._buffer)
-
-      // If the nextBuffer is nonempty, we have all we need
-      if _fastPath(nextBuffer != Index._emptyBuffer) {
-        return Index(_coreIndex: nextCoreIndex, nextBuffer)
+      if _fastPath(_guts.isASCII) {
+        precondition(i.encodedOffset < _guts.count)
+        return Index(encodedOffset: i.encodedOffset + 1)
       }
-      // If the underlying UTF16 isn't exhausted, fill a new buffer
-      else if _fastPath(nextCoreIndex < _core.endIndex) {
-        let (_, freshBuffer) = _core._encodeSomeUTF8(from: nextCoreIndex)
-        return Index(_coreIndex: nextCoreIndex, freshBuffer)
+
+      var j = i
+
+      // Ensure j's cache is utf8
+      if _slowPath(j._cache.utf8 == nil) {
+        j = _index(atEncodedOffset: j.encodedOffset)
+        precondition(j != endIndex, "Index out of bounds")
+      }
+
+      let buffer = j._cache.utf8._unsafelyUnwrappedUnchecked
+
+      var scalarLength16 = 1
+      let b0 = buffer.first._unsafelyUnwrappedUnchecked
+      var nextBuffer = buffer
+
+      let leading1s = (~b0).leadingZeroBitCount
+      if _fastPath(leading1s == 0) { // ASCII in buffer; just consume it
+        nextBuffer.removeFirst()
       }
       else {
-        // Produce the endIndex
-        _precondition(
-          nextCoreIndex == _core.endIndex,
-          "Can't increment past endIndex of String.UTF8View")
-        return Index(_coreIndex: nextCoreIndex, nextBuffer)
+        // Number of bytes consumed in this scalar
+        let n8 = j._transcodedOffset + 1
+        // If we haven't reached a scalar boundary...
+        if _fastPath(n8 < leading1s) {
+          // Advance to the next position in this scalar
+          return Index(
+            encodedOffset: j.encodedOffset,
+            transcodedOffset: n8, .utf8(buffer: buffer))
+        }
+        // We reached a scalar boundary; compute the underlying utf16's width
+        // based on the number of utf8 code units
+        scalarLength16 = n8 >> 2 + 1
+        nextBuffer.removeFirst(n8)
       }
+
+      if _fastPath(!nextBuffer.isEmpty) {
+        return Index(
+          encodedOffset: j.encodedOffset + scalarLength16,
+          .utf8(buffer: nextBuffer))
+      }
+      // If nothing left in the buffer, refill it.
+      return _index(atEncodedOffset: j.encodedOffset + scalarLength16)
+    }
+
+    @_inlineable // FIXME(sil-serialize-all)
+    public func index(before i: Index) -> Index {
+      if _fastPath(_guts.isASCII) {
+        precondition(i.encodedOffset > 0)
+        return Index(encodedOffset: i.encodedOffset - 1)
+      }
+
+      if i._transcodedOffset != 0 {
+        _sanityCheck(i._cache.utf8 != nil)
+        var r = i
+        r._compoundOffset = r._compoundOffset &- 1
+        return r
+      }
+
+      // Handle the scalar boundary the same way as the not-a-utf8-index case.
+      _precondition(i.encodedOffset > 0, "Can't move before startIndex")
+
+      // Parse a single scalar
+      let u = _guts.unicodeScalar(endingAt: i.encodedOffset)
+      let u8 = Unicode.UTF8.encode(u)._unsafelyUnwrappedUnchecked
+      return Index(
+        encodedOffset: i.encodedOffset &- (u8.count < 4 ? 1 : 2),
+        transcodedOffset: u8.count &- 1,
+        .utf8(buffer: String.Index._UTF8Buffer(u8))
+      )
+    }
+
+    @_inlineable // FIXME(sil-serialize-all)
+    public func distance(from i: Index, to j: Index) -> Int {
+      if _fastPath(_guts.isASCII) {
+        return j.encodedOffset - i.encodedOffset
+      }
+      return j >= i
+        ? _forwardDistance(from: i, to: j) : -_forwardDistance(from: j, to: i)
+    }
+
+    @_inlineable // FIXME(sil-serialize-all)
+    @_versioned
+    @inline(__always)
+    internal func _forwardDistance(from i: Index, to j: Index) -> Int {
+      return j._transcodedOffset - i._transcodedOffset +
+        String.UTF8View._count(fromUTF16: IteratorSequence(_guts.makeIterator(
+          in: i.encodedOffset..<j.encodedOffset)))
     }
 
     /// Accesses the code unit at the given position.
@@ -348,34 +301,45 @@ extension String {
     ///
     /// - Parameter position: A valid index of the view. `position`
     ///   must be less than the view's end index.
+    @_inlineable // FIXME(sil-serialize-all)
     public subscript(position: Index) -> UTF8.CodeUnit {
-      let result = UTF8.CodeUnit(extendingOrTruncating: position._buffer & 0xFF)
-      _precondition(result != 0xFF, "cannot subscript using endIndex")
-      return result
+      @inline(__always)
+      get {
+        if _fastPath(_guts.isASCII) {
+          let ascii = _guts._unmanagedASCIIView
+          let offset = position.encodedOffset
+          _precondition(offset < ascii.count, "Index out of bounds")
+          return ascii.buffer[position.encodedOffset]
+        }
+        var j = position
+        while true {
+          if case .utf8(let buffer) = j._cache {
+            _onFastPath()
+            return buffer[
+              buffer.index(buffer.startIndex, offsetBy: j._transcodedOffset)]
+          }
+          j = _index(atEncodedOffset: j.encodedOffset)
+          precondition(j < endIndex, "Index out of bounds")
+        }
+      }
     }
 
-    /// Accesses the contiguous subrange of elements enclosed by the specified
-    /// range.
-    ///
-    /// - Complexity: O(*n*) if the underlying string is bridged from
-    ///   Objective-C, where *n* is the length of the string; otherwise, O(1).
-    public subscript(bounds: Range<Index>) -> UTF8View {
-      return UTF8View(_core, bounds.lowerBound, bounds.upperBound)
-    }
-
+    @_inlineable // FIXME(sil-serialize-all)
     public var description: String {
-      return String._fromCodeUnitSequenceWithRepair(UTF8.self, input: self).0
+      return String(_guts)
     }
 
+    @_inlineable // FIXME(sil-serialize-all)
     public var debugDescription: String {
       return "UTF8View(\(self.description.debugDescription))"
     }
   }
 
   /// A UTF-8 encoding of `self`.
+  @_inlineable // FIXME(sil-serialize-all)
   public var utf8: UTF8View {
     get {
-      return UTF8View(self._core)
+      return UTF8View(self._guts)
     }
     set {
       self = String(describing: newValue)
@@ -396,6 +360,7 @@ extension String {
   ///         print(strlen(ptr.baseAddress!))
   ///     }
   ///     // Prints "6"
+  @_inlineable // FIXME(sil-serialize-all)
   public var utf8CString: ContiguousArray<CChar> {
     var result = ContiguousArray<CChar>()
     result.reserveCapacity(utf8.count + 1)
@@ -406,13 +371,13 @@ extension String {
     return result
   }
 
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
   internal func _withUnsafeBufferPointerToUTF8<R>(
     _ body: (UnsafeBufferPointer<UTF8.CodeUnit>) throws -> R
   ) rethrows -> R {
-    if let asciiBuffer = self._core.asciiBuffer {
-      return try body(UnsafeBufferPointer(
-        start: asciiBuffer.baseAddress,
-        count: asciiBuffer.count))
+    if _guts.isASCII {
+      return try body(_guts._unmanagedASCIIView.buffer)
     }
     var nullTerminatedUTF8 = ContiguousArray<UTF8.CodeUnit>()
     nullTerminatedUTF8.reserveCapacity(utf8.count + 1)
@@ -430,7 +395,7 @@ extension String {
   ///
   ///     let picnicGuest = "Deserving porcupine"
   ///     if let i = picnicGuest.utf8.index(of: 32) {
-  ///         let adjective = String(picnicGuest.utf8.prefix(upTo: i))
+  ///         let adjective = String(picnicGuest.utf8[..<i])
   ///         print(adjective)
   ///     }
   ///     // Prints "Optional(Deserving)"
@@ -439,79 +404,181 @@ extension String {
   /// slice of the `picnicGuest.utf8` view.
   ///
   /// - Parameter utf8: A UTF-8 code sequence.
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(swift, deprecated: 3.2,
+    message: "Failable initializer was removed in Swift 4. When upgrading to Swift 4, please use non-failable String.init(_:UTF8View)")
+  @available(swift, obsoleted: 4.0,
+    message: "Please use non-failable String.init(_:UTF8View) instead")
   public init?(_ utf8: UTF8View) {
-    let wholeString = String(utf8._core)
-
-    if let start = utf8.startIndex.samePosition(in: wholeString),
-       let end = utf8.endIndex.samePosition(in: wholeString) {
-      self = wholeString[start..<end]
-      return
+    if utf8.startIndex._transcodedOffset != 0
+      || utf8.endIndex._transcodedOffset != 0
+      || utf8._legacyPartialCharacters.start
+      || utf8._legacyPartialCharacters.end {
+      return nil
     }
-    return nil
+    self = String(utf8._guts)
   }
 
-  /// The index type for subscripting a string's `utf8` view.
+  /// Creates a string corresponding to the given sequence of UTF-8 code units.
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(swift, introduced: 4.0, message:
+    "Please use failable String.init?(_:UTF8View) when in Swift 3.2 mode")
+  public init(_ utf8: UTF8View) {
+    self = String(utf8._guts)
+  }
+
+  /// The index type for subscripting a string.
   public typealias UTF8Index = UTF8View.Index
 }
 
-extension String.UTF8View.Index : Comparable {
-  // FIXME: swift-3-indexing-model: add complete set of forwards for Comparable 
-  //        assuming String.UTF8View.Index continues to exist
-  public static func == (
-    lhs: String.UTF8View.Index,
-    rhs: String.UTF8View.Index
-  ) -> Bool {
-    // If the underlying UTF16 index differs, they're unequal
-    if lhs._coreIndex != rhs._coreIndex {
-      return false
-    }
-
-    // Match up bytes in the buffer
-    var buffer = (lhs._buffer, rhs._buffer)
-    var isContinuation: Bool
-    while true {
-      let unit = (
-        UTF8.CodeUnit(extendingOrTruncating: buffer.0),
-        UTF8.CodeUnit(extendingOrTruncating: buffer.1))
-
-      isContinuation = UTF8.isContinuation(unit.0)
-      if !isContinuation {
-        // We don't check for unit equality in this case because one of
-        // the units might be an 0xFF read from the end of the buffer.
-        return !UTF8.isContinuation(unit.1)
-      }
-      // Continuation bytes must match exactly
-      else if unit.0 != unit.1 {
-        return false
-      }
-
-      // Move the buffers along.
-      buffer = (
-        String.UTF8Index._nextBuffer(after: buffer.0),
-        String.UTF8Index._nextBuffer(after: buffer.1))
-    }
+extension String.UTF8View : _SwiftStringView {
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal var _persistentContent : String {
+    return String(self._guts)
   }
 
-  public static func < (
-    lhs: String.UTF8View.Index,
-    rhs: String.UTF8View.Index
-  ) -> Bool {
-    if lhs._coreIndex == rhs._coreIndex && lhs._buffer != rhs._buffer {
-      // The index with more continuation bytes remaining before the next
-      return lhs._utf8ContinuationBytesUntilNextUnicodeScalar >
-        rhs._utf8ContinuationBytesUntilNextUnicodeScalar
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  var _wholeString : String {
+    return String(_guts)
+  }
+
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  var _encodedOffsetRange : Range<Int> {
+    return 0..<_guts.count
+  }
+}
+
+extension String.UTF8View {
+  @_fixed_layout // FIXME(sil-serialize-all)
+  public struct Iterator {
+    internal typealias _OutputBuffer = _ValidUTF8Buffer<UInt64>
+    @_versioned
+    internal let _guts: _StringGuts
+    @_versioned
+    internal let _endOffset: Int
+    @_versioned // FIXME(sil-serialize-all)
+    internal var _nextOffset: Int
+    @_versioned // FIXME(sil-serialize-all)
+    internal var _buffer: _OutputBuffer
+  }
+
+  public func makeIterator() -> Iterator {
+    return Iterator(self)
+  }
+}
+
+extension String.UTF8View.Iterator : IteratorProtocol {
+  public typealias Element = String.UTF8View.Element
+
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal init(_ utf8: String.UTF8View) {
+    self._guts = utf8._guts
+    self._nextOffset = 0
+    self._buffer = _OutputBuffer()
+    self._endOffset = utf8._guts.count
+  }
+
+  @_inlineable // FIXME(sil-serialize-all)
+  public mutating func next() -> Unicode.UTF8.CodeUnit? {
+    if _slowPath(_nextOffset == _endOffset) {
+      if _slowPath(_buffer.isEmpty) {
+        return nil
+      }
     }
-    return lhs._coreIndex < rhs._coreIndex
+    if _guts.isASCII {
+      defer { _nextOffset += 1 }
+      return _guts._unmanagedASCIIView.buffer[_nextOffset]
+    }
+
+    if _fastPath(!_buffer.isEmpty) {
+      return _buffer.removeFirst()
+    }
+    return _fillBuffer()
+  }
+
+  @_versioned
+  @inline(never)
+  internal mutating func _fillBuffer() -> Unicode.UTF8.CodeUnit {
+    _sanityCheck(!_guts.isASCII, "next() already checks for known ASCII")
+    if _slowPath(_guts._isOpaque) {
+      return _opaqueFillBuffer()
+    }
+
+    defer { _fixLifetime(_guts) }
+    return _fillBuffer(from: _guts._unmanagedUTF16View)
+  }
+
+  @_versioned // @opaque
+  internal mutating func _opaqueFillBuffer() -> Unicode.UTF8.CodeUnit {
+    _sanityCheck(_guts._isOpaque)
+    defer { _fixLifetime(_guts) }
+    return _fillBuffer(from: _guts._asOpaque())
+  }
+
+  // NOT @_versioned
+  internal mutating func _fillBuffer<V: _StringVariant>(
+    from variant: V
+  ) -> Unicode.UTF8.CodeUnit {
+    // Eat as many ASCII characters as possible
+    let asciiEnd = Swift.min(_nextOffset + _buffer.capacity, _endOffset)
+    for cu in variant[_nextOffset..<asciiEnd] {
+      if !UTF16._isASCII(cu) { break }
+      _buffer.append(UInt8(truncatingIfNeeded: cu))
+      _nextOffset += 1
+    }
+    if _nextOffset == asciiEnd {
+      return _buffer.removeFirst()
+    }
+    // Decode UTF-16, encode UTF-8
+    for scalar in IteratorSequence(
+      variant[_nextOffset..<_endOffset].makeUnicodeScalarIterator()) {
+      let u8 = UTF8.encode(scalar)._unsafelyUnwrappedUnchecked
+      let c8 = u8.count
+      guard _buffer.count + c8 <= _buffer.capacity else { break }
+      _buffer.append(contentsOf: u8)
+      _nextOffset += 1 &+ (c8 &>> 2)
+    }
+    return _buffer.removeFirst()
+  }
+}
+
+extension String.UTF8View {
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal static func _count<Source: Sequence>(fromUTF16 source: Source) -> Int
+  where Source.Element == Unicode.UTF16.CodeUnit
+  {
+    var result = 0
+    var prev: Unicode.UTF16.CodeUnit = 0
+    for u in source {
+      switch u {
+      case 0..<0x80: result += 1
+      case 0x80..<0x800: result += 2
+      case 0x800..<0xDC00: result += 3
+      case 0xDC00..<0xE000: result += UTF16.isLeadSurrogate(prev) ? 1 : 3
+      default: result += 3
+      }
+      prev = u
+    }
+    return result
+  }
+
+  @_inlineable // FIXME(sil-serialize-all)
+  public var count: Int {
+    if _fastPath(_guts.isASCII) { return _guts.count }
+    return _visitGuts(_guts,
+      ascii: { ascii in return ascii.count },
+      utf16: { utf16 in return String.UTF8View._count(fromUTF16: utf16) },
+      opaque: { opaque in return String.UTF8View._count(fromUTF16: opaque) })
   }
 }
 
 // Index conversions
 extension String.UTF8View.Index {
-  internal init(_ core: _StringCore, _utf16Offset: Int) {
-      let (_, buffer) = core._encodeSomeUTF8(from: _utf16Offset)
-      self.init(_coreIndex: _utf16Offset, buffer)
-  }
-
   /// Creates an index in the given UTF-8 view that corresponds exactly to the
   /// specified `UTF16View` position.
   ///
@@ -524,7 +591,7 @@ extension String.UTF8View.Index {
   ///     let utf16Index = cafe.utf16.index(of: 32)!
   ///     let utf8Index = String.UTF8View.Index(utf16Index, within: cafe.utf8)!
   ///
-  ///     print(Array(cafe.utf8.prefix(upTo: utf8Index)))
+  ///     print(Array(cafe.utf8[..<utf8Index]))
   ///     // Prints "[67, 97, 102, 195, 169]"
   ///
   /// If the position passed in `utf16Index` doesn't have an exact
@@ -547,176 +614,125 @@ extension String.UTF8View.Index {
   ///     // Prints "nil"
   ///
   /// - Parameters:
-  ///   - utf16Index: A position in a `UTF16View` instance. `utf16Index` must
-  ///     be an element in `String(utf8).utf16.indices`.
-  ///   - utf8: The `UTF8View` in which to find the new position.
-  public init?(_ utf16Index: String.UTF16Index, within utf8: String.UTF8View) {
-    let utf16 = String.UTF16View(utf8._core)
+  ///   - sourcePosition: A position in a `String` or one of its views.
+  ///   - target: The `UTF8View` in which to find the new position.
+  @_inlineable // FIXME(sil-serialize-all)
+  public init?(_ sourcePosition: String.Index, within target: String.UTF8View) {
+    switch sourcePosition._cache {
+    case .utf8:
+      self.init(encodedOffset: sourcePosition.encodedOffset,
+        transcodedOffset:sourcePosition._transcodedOffset, sourcePosition._cache)
 
-    if utf16Index != utf16.startIndex
-    && utf16Index != utf16.endIndex {
-      _precondition(
-        utf16Index >= utf16.startIndex
-        && utf16Index <= utf16.endIndex,
-        "Invalid String.UTF16Index for this UTF-8 view")
-
-      // Detect positions that have no corresponding index.  Note that
-      // we have to check before and after, because an unpaired
-      // surrogate will be decoded as a single replacement character,
-      // thus making the corresponding position valid in UTF8.
-      if UTF16.isTrailSurrogate(utf16[utf16Index])
-        && UTF16.isLeadSurrogate(utf16[utf16.index(before: utf16Index)]) {
-        return nil
-      }
+    default:
+      guard String.UnicodeScalarView(target._guts)._isOnUnicodeScalarBoundary(
+        sourcePosition) else { return nil }
+      self.init(encodedOffset: sourcePosition.encodedOffset)
     }
-    self.init(utf8._core, _utf16Offset: utf16Index._offset)
-  }
-
-  /// Creates an index in the given UTF-8 view that corresponds exactly to the
-  /// specified `UnicodeScalarView` position.
-  ///
-  /// The following example converts the position of the Unicode scalar `"e"`
-  /// into its corresponding position in the string's `utf8` view.
-  ///
-  ///     let cafe = "Cafe\u{0301}"
-  ///     let scalarsIndex = cafe.unicodeScalars.index(of: "e")!
-  ///     let utf8Index = String.UTF8View.Index(scalarsIndex, within: cafe.utf8)
-  ///
-  ///     print(Array(cafe.utf8.prefix(through: utf8Index)))
-  ///     // Prints "[67, 97, 102, 101]"
-  ///
-  /// - Parameters:
-  ///   - unicodeScalarIndex: A position in a `UnicodeScalarView` instance.
-  ///     `unicodeScalarIndex` must be an element of
-  ///     `String(utf8).unicodeScalars.indices`.
-  ///   - utf8: The `UTF8View` in which to find the new position.
-  public init(
-    _ unicodeScalarIndex: String.UnicodeScalarIndex,
-    within utf8: String.UTF8View
-  ) {
-    self.init(utf8._core, _utf16Offset: unicodeScalarIndex._position)
-  }
-
-  /// Creates an index in the given UTF-8 view that corresponds exactly to the
-  /// specified string position.
-  ///
-  /// The following example converts the position of the teacup emoji (`"🍵"`)
-  /// into its corresponding position in the string's `utf8` view.
-  ///
-  ///     let cafe = "Café 🍵"
-  ///     let characterIndex = cafe.characters.index(of: "🍵")!
-  ///     let utf8Index = String.UTF8View.Index(characterIndex, within: cafe.utf8)
-  ///
-  ///     print(Array(cafe.utf8.suffix(from: utf8Index)))
-  ///     // Prints "[240, 159, 141, 181]"
-  ///
-  /// - Parameters:
-  ///   - characterIndex: A position in a `CharacterView` instance.
-  ///     `characterIndex` must be an element of
-  ///     `String(utf8).characters.indices`.
-  ///   - utf8: The `UTF8View` in which to find the new position.
-  public init(_ characterIndex: String.Index, within utf8: String.UTF8View) {
-    self.init(utf8._core, _utf16Offset: characterIndex._base._position)
-  }
-
-  /// Returns the position in the given UTF-16 view that corresponds exactly to
-  /// this index.
-  ///
-  /// The index must be a valid index of `String(utf16).utf8`.
-  ///
-  /// This example first finds the position of a space (UTF-8 code point `32`)
-  /// in a string's `utf8` view and then uses this method to find the same
-  /// position in the string's `utf16` view.
-  ///
-  ///     let cafe = "Café 🍵"
-  ///     let i = cafe.utf8.index(of: 32)!
-  ///     let j = i.samePosition(in: cafe.utf16)!
-  ///     print(cafe.utf16.prefix(upTo: j))
-  ///     // Prints "Café"
-  ///
-  /// - Parameter utf16: The view to use for the index conversion.
-  /// - Returns: The position in `utf16` that corresponds exactly to this
-  ///   index. If this index does not have an exact corresponding position in
-  ///   `utf16`, this method returns `nil`. For example, an attempt to convert
-  ///   the position of a UTF-8 continuation byte returns `nil`.
-  public func samePosition(
-    in utf16: String.UTF16View
-  ) -> String.UTF16View.Index? {
-    return String.UTF16View.Index(self, within: utf16)
-  }
-
-  /// Returns the position in the given view of Unicode scalars that
-  /// corresponds exactly to this index.
-  ///
-  /// This index must be a valid index of `String(unicodeScalars).utf8`.
-  ///
-  /// This example first finds the position of a space (UTF-8 code point `32`)
-  /// in a string's `utf8` view and then uses this method to find the same position
-  /// in the string's `unicodeScalars` view.
-  ///
-  ///     let cafe = "Café 🍵"
-  ///     let i = cafe.utf8.index(of: 32)!
-  ///     let j = i.samePosition(in: cafe.unicodeScalars)!
-  ///     print(cafe.unicodeScalars.prefix(upTo: j))
-  ///     // Prints "Café"
-  ///
-  /// - Parameter unicodeScalars: The view to use for the index conversion.
-  /// - Returns: The position in `unicodeScalars` that corresponds exactly to
-  ///   this index. If this index does not have an exact corresponding
-  ///   position in `unicodeScalars`, this method returns `nil`. For example,
-  ///   an attempt to convert the position of a UTF-8 continuation byte
-  ///   returns `nil`.
-  public func samePosition(
-    in unicodeScalars: String.UnicodeScalarView
-  ) -> String.UnicodeScalarIndex? {
-    return String.UnicodeScalarIndex(self, within: unicodeScalars)
-  }
-
-  /// Returns the position in the given string that corresponds exactly to this
-  /// index.
-  ///
-  /// This index must be a valid index of `characters.utf8`.
-  ///
-  /// This example first finds the position of a space (UTF-8 code point `32`)
-  /// in a string's `utf8` view and then uses this method find the same position
-  /// in the string.
-  ///
-  ///     let cafe = "Café 🍵"
-  ///     let i = cafe.utf8.index(of: 32)!
-  ///     let j = i.samePosition(in: cafe)!
-  ///     print(cafe[cafe.startIndex ..< j])
-  ///     // Prints "Café"
-  ///
-  /// - Parameter characters: The string to use for the index conversion.
-  /// - Returns: The position in `characters` that corresponds exactly to
-  ///   this index. If this index does not have an exact corresponding
-  ///   position in `characters`, this method returns `nil`. For example,
-  ///   an attempt to convert the position of a UTF-8 continuation byte
-  ///   returns `nil`.
-  public func samePosition(
-    in characters: String
-  ) -> String.Index? {
-    return String.Index(self, within: characters)
   }
 }
 
 // Reflection
 extension String.UTF8View : CustomReflectable {
   /// Returns a mirror that reflects the UTF-8 view of a string.
+  @_inlineable // FIXME(sil-serialize-all)
   public var customMirror: Mirror {
     return Mirror(self, unlabeledChildren: self)
   }
 }
 
 extension String.UTF8View : CustomPlaygroundQuickLookable {
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(*, deprecated, message: "UTF8View.customPlaygroundQuickLook will be removed in a future Swift version")
   public var customPlaygroundQuickLook: PlaygroundQuickLook {
     return .text(description)
   }
 }
 
-extension String {
-  @available(*, unavailable, message: "Please use String.utf8CString instead.")
-  public var nulTerminatedUTF8: ContiguousArray<UTF8.CodeUnit> {
-    Builtin.unreachable()
+// backward compatibility for index interchange.
+extension String.UTF8View {
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(
+    swift, obsoleted: 4.0,
+    message: "Any String view index conversion can fail in Swift 4; please unwrap the optional index")
+  public func index(after i: Index?) -> Index {
+    return index(after: i!)
+  }
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(
+    swift, obsoleted: 4.0,
+    message: "Any String view index conversion can fail in Swift 4; please unwrap the optional index")
+  public func index(_ i: Index?, offsetBy n: Int) -> Index {
+    return index(i!, offsetBy: n)
+  }
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(
+    swift, obsoleted: 4.0,
+    message: "Any String view index conversion can fail in Swift 4; please unwrap the optional indices")
+  public func distance(
+    from i: Index?, to j: Index?) -> Int {
+    return distance(from: i!, to: j!)
+  }
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(
+    swift, obsoleted: 4.0,
+    message: "Any String view index conversion can fail in Swift 4; please unwrap the optional index")
+  public subscript(i: Index?) -> Unicode.UTF8.CodeUnit {
+    return self[i!]
+  }
+}
+
+//===--- Slicing Support --------------------------------------------------===//
+/// In Swift 3.2, in the absence of type context,
+///
+///   someString.utf8[someString.utf8.startIndex..<someString.utf8.endIndex]
+///
+/// was deduced to be of type `String.UTF8View`.  Provide a more-specific
+/// Swift-3-only `subscript` overload that continues to produce
+/// `String.UTF8View`.
+extension String.UTF8View {
+  public typealias SubSequence = Substring.UTF8View
+
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(swift, introduced: 4)
+  public subscript(r: Range<Index>) -> String.UTF8View.SubSequence {
+    return String.UTF8View.SubSequence(self, _bounds: r)
+  }
+
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(swift, obsoleted: 4)
+  public subscript(r: Range<Index>) -> String.UTF8View {
+    let wholeString = String(_guts)
+    let legacyPartialCharacters = (
+      (self._legacyPartialCharacters.start &&
+        r.lowerBound.encodedOffset == 0) ||
+      r.lowerBound.samePosition(in: wholeString) == nil,
+      (self._legacyPartialCharacters.end &&
+        r.upperBound.encodedOffset == _guts.count) ||
+      r.upperBound.samePosition(in: wholeString) == nil)
+
+    if r.upperBound._transcodedOffset == 0 {
+      return String.UTF8View(
+        _guts._extractSlice(
+        r.lowerBound.encodedOffset..<r.upperBound.encodedOffset),
+        legacyOffsets: (r.lowerBound._transcodedOffset, 0),
+        legacyPartialCharacters: legacyPartialCharacters)
+    }
+
+    let b0 = r.upperBound._cache.utf8!.first!
+    let scalarLength8 = (~b0).leadingZeroBitCount
+    let scalarLength16 = scalarLength8 == 4 ? 2 : 1
+    let coreEnd = r.upperBound.encodedOffset + scalarLength16
+    return String.UTF8View(
+      _guts._extractSlice(r.lowerBound.encodedOffset..<coreEnd),
+      legacyOffsets: (
+        r.lowerBound._transcodedOffset,
+        r.upperBound._transcodedOffset - scalarLength8),
+      legacyPartialCharacters: legacyPartialCharacters)
+  }
+
+  @_inlineable // FIXME(sil-serialize-all)
+  @available(swift, obsoleted: 4)
+  public subscript(bounds: ClosedRange<Index>) -> String.UTF8View {
+    return self[bounds.relative(to: self)]
   }
 }

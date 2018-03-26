@@ -4,14 +4,14 @@
 // Verify that -Onone shadow copies are emitted for debug_value_addr
 // instructions.
 
-// CHECK-SIL: sil hidden @_T016debug_value_addr4testyxlF
+// CHECK-SIL: sil hidden @$S16debug_value_addr4testyyxlF
 // CHECK-SIL: debug_value_addr %0 : $*T, let, name "t"
 
-// CHECK: define {{.*}}_T016debug_value_addr4testyxlF
+// CHECK: define {{.*}}$S16debug_value_addr4testyyxlF
 // CHECK: entry:
 // CHECK-NEXT: %[[TADDR:.*]] = alloca
-// CHECK: store %swift.opaque* %0, %swift.opaque** %[[TADDR:.*]], align
 // CHECK-NEXT: call void @llvm.dbg.declare({{.*}}%[[TADDR]]
+// CHECK: store %swift.opaque* %0, %swift.opaque** %[[TADDR:.*]], align
 
 struct S<T> {
   var a : T

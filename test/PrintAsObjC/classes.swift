@@ -2,8 +2,7 @@
 
 // REQUIRES: objc_interop
 
-// RUN: rm -rf %t
-// RUN: mkdir -p %t
+// RUN: %empty-directory(%t)
 
 // FIXME: BEGIN -enable-source-import hackaround
 // RUN:  %target-swift-frontend(mock-sdk: -sdk %S/../Inputs/clang-importer-sdk -I %t) -emit-module -o %t %S/../Inputs/clang-importer-sdk/swift-modules/ObjectiveC.swift
@@ -19,7 +18,7 @@
 // RUN: %FileCheck --check-prefix=NEGATIVE %s < %t/classes.h
 // RUN: %check-in-clang -I %S/Inputs/custom-modules/ %t/classes.h
 // RUN: not %check-in-clang -I %S/Inputs/custom-modules/ -fno-modules -Qunused-arguments %t/classes.h
-// RUN: %check-in-clang -I %S/Inputs/custom-modules/ -fno-modules -Qunused-arguments %t/classes.h -include Foundation.h -include CoreFoundation.h -include objc_generics.h -include SingleGenericClass.h
+// RUN: %check-in-clang -I %S/Inputs/custom-modules/ -fno-modules -Qunused-arguments %t/classes.h -include Foundation.h -include CoreFoundation.h -include objc_generics.h -include SingleGenericClass.h -include CompatibilityAlias.h
 
 // CHECK-NOT: AppKit;
 // CHECK-NOT: Properties;
@@ -28,6 +27,7 @@
 // CHECK-NEXT: @import CoreGraphics;
 // CHECK-NEXT: @import CoreFoundation;
 // CHECK-NEXT: @import objc_generics;
+// CHECK-NEXT: @import CompatibilityAlias;
 // CHECK-NEXT: @import SingleGenericClass;
 // CHECK-NOT: AppKit;
 // CHECK-NOT: Swift;
@@ -35,6 +35,7 @@ import Foundation
 import objc_generics
 import AppKit // only used in implementations
 import CoreFoundation
+import CompatibilityAlias
 import SingleGenericClass
 
 // CHECK-LABEL: @interface A1{{$}}
@@ -174,6 +175,15 @@ class DiscardableResult : NSObject {
   @objc init(evenMoreFun: ()) { super.init() }
 }
 
+// CHECK-LABEL: @interface InheritedInitializersRequired
+// CHECK-NEXT: - (nonnull instancetype)initWithEvenMoreFun OBJC_DESIGNATED_INITIALIZER;
+// CHECK-NEXT: - (nonnull instancetype)init SWIFT_UNAVAILABLE;
+// CHECK-NEXT: + (nonnull instancetype)new SWIFT_DEPRECATED_MSG("-init is unavailable");
+// CHECK-NEXT: @end
+@objc class InheritedInitializersRequired : InheritedInitializers {
+  @objc required init(evenMoreFun: ()) { super.init() }
+}
+
 // NEGATIVE-NOT: NotObjC
 class NotObjC {}
 
@@ -192,6 +202,7 @@ class NotObjC {}
 // CHECK-NEXT: - (void)testSizedUnsignedTypes:(uint8_t)a b:(uint16_t)b c:(uint32_t)c d:(uint64_t)d;
 // CHECK-NEXT: - (void)testSizedFloats:(float)a b:(double)b;
 // CHECK-NEXT: - (nonnull instancetype)getDynamicSelf SWIFT_WARN_UNUSED_RESULT;
+// CHECK-NEXT: - (null_unspecified instancetype)getDynamicSelfIUO SWIFT_WARN_UNUSED_RESULT;
 // CHECK-NEXT: + (SWIFT_METATYPE(Methods) _Nonnull)getSelf SWIFT_WARN_UNUSED_RESULT;
 // CHECK-NEXT: - (Methods * _Nullable)maybeGetSelf SWIFT_WARN_UNUSED_RESULT;
 // CHECK-NEXT: + (SWIFT_METATYPE(Methods) _Nullable)maybeGetSelf SWIFT_WARN_UNUSED_RESULT;
@@ -215,6 +226,7 @@ class NotObjC {}
 // CHECK-NEXT: - (void)initAllTheThings SWIFT_METHOD_FAMILY(none);
 // CHECK-NEXT: - (void)initTheOtherThings SWIFT_METHOD_FAMILY(none);
 // CHECK-NEXT: - (void)initializeEvenMoreThings;
+// CHECK-NEXT: + (Methods * _Nonnull)newWithFoo:(NSInteger)foo SWIFT_WARN_UNUSED_RESULT;
 // CHECK-NEXT: init
 // CHECK-NEXT: @end
 @objc class Methods {
@@ -237,6 +249,7 @@ class NotObjC {}
   @objc func testSizedFloats(_ a: Float32, b: Float64) {}
 
   @objc func getDynamicSelf() -> Self { return self }
+  @objc func getDynamicSelfIUO() -> Self! { return self }
   @objc class func getSelf() -> Methods.Type { return self }
 
   @objc func maybeGetSelf() -> Methods? { return nil }
@@ -274,6 +287,8 @@ class NotObjC {}
   @objc func initAllTheThings() {}
   @objc(initTheOtherThings) func setUpOtherThings() {}
   @objc func initializeEvenMoreThings() {}
+
+  @objc(newWithFoo:) class func make(foo: Int) -> Methods { return Methods() }
 }
 
 typealias AliasForNSRect = NSRect
@@ -421,6 +436,41 @@ class MyObject : NSObject {}
   // CHECK-NEXT: init
   // CHECK-NEXT: @end
   @objc class Subclass : NestedSuperclass {}
+}
+
+// CHECK-LABEL: @interface NewBanned
+// CHECK-NEXT: - (nonnull instancetype)initWithArbitraryArgument:(NSInteger)arbitraryArgument OBJC_DESIGNATED_INITIALIZER;
+// CHECK-NEXT: - (nonnull instancetype)init SWIFT_UNAVAILABLE;
+// CHECK-NEXT: + (nonnull instancetype)new SWIFT_DEPRECATED_MSG("-init is unavailable");
+// CHECK-NEXT: @end
+@objc class NewBanned : NSObject {
+  init(arbitraryArgument: Int) { super.init() }
+}
+
+// CHECK-LABEL: @interface NewBanned
+// CHECK-NEXT: - (nonnull instancetype)initWithDifferentArbitraryArgument:(NSInteger)differentArbitraryArgument OBJC_DESIGNATED_INITIALIZER;
+// CHECK-NEXT: - (nonnull instancetype)initWithArbitraryArgument:(NSInteger)arbitraryArgument SWIFT_UNAVAILABLE;
+// CHECK-NEXT: @end
+@objc class NewBannedStill : NewBanned {
+  init(differentArbitraryArgument: Int) { super.init(arbitraryArgument: 0) }
+}
+
+// CHECK-LABEL: @interface NewUnbanned
+// CHECK-NEXT: - (nonnull instancetype)init OBJC_DESIGNATED_INITIALIZER;
+// CHECK-NEXT: + (nonnull instancetype)new;
+// CHECK-NEXT: - (nonnull instancetype)initWithArbitraryArgument:(NSInteger)arbitraryArgument SWIFT_UNAVAILABLE;
+// CHECK-NEXT: @end
+@objc class NewUnbanned : NewBanned {
+  init() { super.init(arbitraryArgument: 0) }
+}
+
+// CHECK-LABEL: @interface NewUnbannedDouble
+// CHECK-NEXT: - (nonnull instancetype)init OBJC_DESIGNATED_INITIALIZER;
+// CHECK-NEXT: + (nonnull instancetype)new;
+// CHECK-NEXT: - (nonnull instancetype)initWithDifferentArbitraryArgument:(NSInteger)differentArbitraryArgument SWIFT_UNAVAILABLE;
+// CHECK-NEXT: @end
+@objc class NewUnbannedDouble : NewBannedStill {
+  init() { super.init(differentArbitraryArgument: 0) }
 }
 
 // NEGATIVE-NOT: @interface Private :
@@ -724,6 +774,15 @@ public class NonObjCClass { }
 
 @objc class Spoon: Fungible {}
 
+// CHECK-LABEL: @interface UsesCompatibilityAlias
+@objc class UsesCompatibilityAlias : NSObject {
+  // CHECK-NEXT: - (StringCheese * _Nullable)foo SWIFT_WARN_UNUSED_RESULT;
+  @objc func foo() -> StringCheese? { return nil }
+
+  // CHECK-NEXT: - (nonnull instancetype)init OBJC_DESIGNATED_INITIALIZER;
+}
+// CHECK-NEXT: @end
+
 // CHECK-LABEL: @interface UsesImportedGenerics
 @objc class UsesImportedGenerics {
   // CHECK: - (GenericClass<id> * _Nonnull)takeAndReturnGenericClass:(GenericClass<NSString *> * _Nullable)x SWIFT_WARN_UNUSED_RESULT;
@@ -739,4 +798,3 @@ public class NonObjCClass { }
   @objc func referenceSingleGenericClass(_: SingleImportedObjCGeneric<AnyObject>?) {}
 }
 // CHECK: @end
-

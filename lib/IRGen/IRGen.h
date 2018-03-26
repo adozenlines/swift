@@ -37,6 +37,7 @@ namespace swift {
 namespace irgen {
   using Lowering::AbstractionPattern;
   using clang::CodeGen::ConstantInitFuture;
+  class IRGenFunction;
 
 /// In IRGen, we use Swift's ClusteredBitVector data structure to
 /// store vectors of spare bits.
@@ -77,10 +78,10 @@ inline IsBitwiseTakable_t &operator&=(IsBitwiseTakable_t &l, IsBitwiseTakable_t 
 }
 
 /// The kind of reference counting implementation a heap object uses.
-enum class ReferenceCounting : unsigned char {
+enum class ReferenceCounting : uint8_t {
   /// The object uses native Swift reference counting.
   Native,
-  
+
   /// The object uses ObjC reference counting.
   ///
   /// When ObjC interop is enabled, native Swift class objects are also ObjC
@@ -89,20 +90,20 @@ enum class ReferenceCounting : unsigned char {
   ///
   /// Blocks are always ObjC reference counting compatible.
   ObjC,
-  
+
   /// The object uses _Block_copy/_Block_release reference counting.
   ///
   /// This is a strict subset of ObjC; all blocks are also ObjC reference
   /// counting compatible. The block is assumed to have already been moved to
   /// the heap so that _Block_copy returns the same object back.
   Block,
-  
+
   /// The object has an unknown reference counting implementation.
   ///
   /// This uses maximally-compatible reference counting entry points in the
   /// runtime.
   Unknown,
-  
+
   /// Cases prior to this one are binary-compatible with Unknown reference
   /// counting.
   LastUnknownCompatible = Unknown,
@@ -114,7 +115,7 @@ enum class ReferenceCounting : unsigned char {
   /// runtime, with a masking layer on top. A bit inside the pointer is used
   /// to signal native Swift refcounting.
   Bridge,
-  
+
   /// The object uses ErrorType's reference counting entry points.
   Error,
 };
@@ -134,16 +135,16 @@ enum OnHeap_t : unsigned char {
 };
 
 /// Whether a function requires extra data.
-enum class ExtraData : unsigned char {
+enum class ExtraData : uint8_t {
   /// The function requires no extra data.
   None,
 
   /// The function requires a retainable object pointer of extra data.
   Retainable,
-  
+
   /// The function takes its block object as extra data.
   Block,
-  
+
   Last_ExtraData = Block
 };
 
@@ -158,7 +159,7 @@ enum IsExact_t : bool {
 ///
 /// See the comment in RelativePointer.h.
 
-enum class SymbolReferenceKind : unsigned char {
+enum class SymbolReferenceKind : uint8_t {
   /// An absolute reference to the object, i.e. an ordinary pointer.
   ///
   /// Generally well-suited for when C compatibility is a must, dynamic
@@ -294,11 +295,11 @@ class Alignment {
 public:
   typedef uint32_t int_type;
 
-  Alignment() : Value(0) {}
-  explicit Alignment(int_type Value) : Value(Value) {}
+  constexpr Alignment() : Value(0) {}
+  constexpr explicit Alignment(int_type Value) : Value(Value) {}
 
-  int_type getValue() const { return Value; }
-  int_type getMaskValue() const { return Value - 1; }
+  constexpr int_type getValue() const { return Value; }
+  constexpr int_type getMaskValue() const { return Value - 1; }
 
   bool isOne() const { return Value == 1; }
   bool isZero() const { return Value == 0; }
@@ -348,7 +349,7 @@ public:
   /// Is this the "invalid" size value?
   bool isInvalid() const { return *this == Size::invalid(); }
 
-  int_type getValue() const { return Value; }
+  constexpr int_type getValue() const { return Value; }
   
   int_type getValueInBits() const { return Value * 8; }
 
@@ -449,6 +450,42 @@ inline Alignment Alignment::alignmentAtOffset(Size S) const {
 inline Size Alignment::asSize() const {
   return Size(getValue());
 }
+
+/// A static or dynamic offset.
+class Offset {
+  enum Kind {
+    Static,
+    Dynamic,
+  };
+  enum : uint64_t {
+    KindBits = 1,
+    KindMask = (1 << KindBits) - 1,
+    PayloadMask = ~uint64_t(KindMask)
+  };
+  uint64_t Data;
+
+public:
+  explicit Offset(llvm::Value *offset)
+    : Data(reinterpret_cast<uintptr_t>(offset) | Dynamic) {}
+  explicit Offset(Size offset)
+    : Data((static_cast<uint64_t>(offset.getValue()) << KindBits) | Static) {
+    assert(getStatic() == offset && "overflow");
+  }
+
+  bool isStatic() const { return (Data & KindMask) == Static; }
+  bool isDynamic() const { return (Data & KindMask) == Dynamic; }
+  Size getStatic() const {
+    assert(isStatic());
+    return Size(static_cast<int64_t>(Data) >> KindBits);
+  }
+  llvm::Value *getDynamic() const {
+    assert(isDynamic());
+    return reinterpret_cast<llvm::Value*>(Data & PayloadMask);
+  }
+
+  llvm::Value *getAsValue(IRGenFunction &IGF) const;
+  Offset offsetBy(IRGenFunction &IGF, Size other) const;
+};
 
 } // end namespace irgen
 } // end namespace swift

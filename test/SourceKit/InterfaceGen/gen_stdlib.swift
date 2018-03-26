@@ -14,10 +14,10 @@ var x: Int
 // CHECK-STDLIB: }
 
 // Check that extensions of nested decls are showing up.
-// CHECK-STDLIB-LABEL: extension String.UTF16View.Index {
+// CHECK-STDLIB-LABEL: extension String.Index {
 // CHECK-STDLIB: func samePosition(in utf8: String.UTF8View) -> String.UTF8View.Index?
-// CHECK-STDLIB: func samePosition(in unicodeScalars: String.UnicodeScalarView) -> String.UnicodeScalarIndex?
 // CHECK-STDLIB: func samePosition(in characters: String) -> String.Index?
+// CHECK-STDLIB: func samePosition(in unicodeScalars: String.UnicodeScalarView) -> String.UnicodeScalarIndex?
 // CHECK-STDLIB-NEXT: }
 
 // CHECK-MUTATING-ATTR: mutating func
@@ -33,7 +33,7 @@ var x: Int
 // CHECK1-NEXT: Int
 // CHECK1-NEXT: s:Si
 // CHECK1-NEXT: Int.Type
-// CHECK1-NEXT: _T0
+// CHECK1-NEXT: $S
 // CHECK1-NEXT: Swift{{$}}
 // CHECK1-NEXT: <Group>Math/Integers</Group>
 // CHECK1-NEXT: /<interface-gen>{{$}}

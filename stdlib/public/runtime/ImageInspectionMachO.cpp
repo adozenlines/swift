@@ -26,31 +26,33 @@
 #include <assert.h>
 #include <dlfcn.h>
 
-#ifndef SWIFT_RUNTIME_DLADDR_ALLOW
-#error "SWIFT_RUNTIME_DLADDR_ALLOW must be defined"
-#endif
-
 using namespace swift;
 
 namespace {
+/// The Mach-O section name for the section containing protocol descriptor
+/// references. This lives within SEG_TEXT.
+constexpr const char ProtocolsSection[] = "__swift4_protos";
 /// The Mach-O section name for the section containing protocol conformances.
 /// This lives within SEG_TEXT.
-constexpr const char ProtocolConformancesSection[] = "__swift2_proto";
+constexpr const char ProtocolConformancesSection[] = "__swift4_proto";
 /// The Mach-O section name for the section containing type references.
 /// This lives within SEG_TEXT.
-constexpr const char TypeMetadataRecordSection[] = "__swift2_types";
+constexpr const char TypeMetadataRecordSection[] = "__swift4_types";
+/// The Mach-O section name for the section containing type field references.
+/// This lives within SEG_TEXT.
+constexpr const char TypeFieldRecordSection[] = "__swift4_fieldmd";
 
 template<const char *SECTION_NAME,
          void CONSUME_BLOCK(const void *start, uintptr_t size)>
 void addImageCallback(const mach_header *mh, intptr_t vmaddr_slide) {
-#ifdef __LP64__
+#if __POINTER_WIDTH__ == 64
   using mach_header_platform = mach_header_64;
   assert(mh->magic == MH_MAGIC_64 && "loaded non-64-bit image?!");
 #else
   using mach_header_platform = mach_header;
 #endif
   
-  // Look for a __swift2_proto section.
+  // Look for a __swift4_proto section.
   unsigned long size;
   const uint8_t *section =
   getsectiondata(reinterpret_cast<const mach_header_platform *>(mh),
@@ -65,6 +67,12 @@ void addImageCallback(const mach_header *mh, intptr_t vmaddr_slide) {
 
 } // end anonymous namespace
 
+void swift::initializeProtocolLookup() {
+  _dyld_register_func_for_add_image(
+    addImageCallback<ProtocolsSection,
+                     addImageProtocolsBlockCallback>);
+}
+
 void swift::initializeProtocolConformanceLookup() {
   _dyld_register_func_for_add_image(
     addImageCallback<ProtocolConformancesSection,
@@ -77,8 +85,13 @@ void swift::initializeTypeMetadataRecordLookup() {
   
 }
 
+void swift::initializeTypeFieldLookup() {
+  _dyld_register_func_for_add_image(
+      addImageCallback<TypeFieldRecordSection,
+                       addImageTypeFieldDescriptorBlockCallback>);
+}
+
 int swift::lookupSymbol(const void *address, SymbolInfo *info) {
-#if SWIFT_RUNTIME_DLADDR_ALLOW
   Dl_info dlinfo;
   if (dladdr(address, &dlinfo) == 0) {
     return 0;
@@ -89,9 +102,6 @@ int swift::lookupSymbol(const void *address, SymbolInfo *info) {
   info->symbolName = dlinfo.dli_sname;
   info->symbolAddress = dlinfo.dli_saddr;
   return 1;
-#else
-  return 0;
-#endif
 }
 
 #endif // defined(__APPLE__) && defined(__MACH__)

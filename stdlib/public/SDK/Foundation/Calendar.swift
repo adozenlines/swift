@@ -42,11 +42,11 @@ public struct Calendar : Hashable, Equatable, ReferenceConvertible, _MutableBoxi
         case republicOfChina
         
         /// A simple tabular Islamic calendar using the astronomical/Thursday epoch of CE 622 July 15
-        @available(OSX 10.10, iOS 8.0, *)
+        @available(macOS 10.10, iOS 8.0, *)
         case islamicTabular
         
         /// The Islamic Umm al-Qura calendar used in Saudi Arabia. This is based on astronomical calculation, instead of tabular behavior.
-        @available(OSX 10.10, iOS 8.0, *)
+        @available(macOS 10.10, iOS 8.0, *)
         case islamicUmmAlQura
         
     }
@@ -417,7 +417,7 @@ public struct Calendar : Hashable, Equatable, ReferenceConvertible, _MutableBoxi
     /// - parameter component: A calendar component.
     /// - parameter date: The specified date.
     /// - returns: A new `DateInterval` if the starting time and duration of a component could be calculated, otherwise `nil`.
-    @available(OSX 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *)
+    @available(macOS 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *)
     public func dateInterval(of component: Component, for date: Date) -> DateInterval? {
         var start : Date = Date(timeIntervalSinceReferenceDate: 0)
         var interval : TimeInterval = 0
@@ -591,7 +591,7 @@ public struct Calendar : Hashable, Equatable, ReferenceConvertible, _MutableBoxi
     public func compare(_ date1: Date, to date2: Date, toUnitGranularity unit: NSCalendar.Unit) -> ComparisonResult { fatalError() }
     
     
-    /// Compares the given dates down to the given component, reporting them `orderedSame` if they are the same in the given component and all larger components, otherwise either `orderedAscending` or `orderedAscending`.
+    /// Compares the given dates down to the given component, reporting them `orderedSame` if they are the same in the given component and all larger components, otherwise either `orderedAscending` or `orderedDescending`.
     ///
     /// - parameter date1: A date to compare.
     /// - parameter date2: A date to compare.
@@ -694,7 +694,7 @@ public struct Calendar : Hashable, Equatable, ReferenceConvertible, _MutableBoxi
     ///
     /// - parameter date: The date contained in the weekend.
     /// - returns: A `DateInterval`, or nil if the date is not in a weekend.
-    @available(OSX 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *)
+    @available(macOS 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *)
     public func dateIntervalOfWeekend(containing date: Date) -> DateInterval? {
         var nsDate : NSDate?
         var ti : TimeInterval = 0
@@ -739,7 +739,7 @@ public struct Calendar : Hashable, Equatable, ReferenceConvertible, _MutableBoxi
     /// - parameter date: The date at which to begin the search.
     /// - parameter direction: Which direction in time to search. The default value is `.forward`.
     /// - returns: A `DateInterval`, or nil if weekends do not exist in the specific calendar or locale.
-    @available(OSX 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *)
+    @available(macOS 10.12, iOS 10.0, tvOS 10.0, watchOS 3.0, *)
     public func nextWeekend(startingAfter date: Date, direction: SearchDirection = .forward) -> DateInterval? {
         // The implementation actually overrides previousKeepSmaller and nextKeepSmaller with matchNext, always - but strict still trumps all.
         var nsDate : NSDate?
@@ -970,7 +970,7 @@ public struct Calendar : Hashable, Equatable, ReferenceConvertible, _MutableBoxi
     }
     
     internal static func _toNSCalendarIdentifier(_ identifier : Identifier) -> NSCalendar.Identifier {
-        if #available(OSX 10.10, iOS 8.0, *) {
+        if #available(macOS 10.10, iOS 8.0, *) {
             let identifierMap : [Identifier : NSCalendar.Identifier] =
                 [.gregorian : .gregorian,
                  .buddhist : .buddhist,
@@ -1009,8 +1009,8 @@ public struct Calendar : Hashable, Equatable, ReferenceConvertible, _MutableBoxi
         }
     }
     
-    private static func _fromNSCalendarIdentifier(_ identifier : NSCalendar.Identifier) -> Identifier {
-        if #available(OSX 10.10, iOS 8.0, *) {
+    internal static func _fromNSCalendarIdentifier(_ identifier : NSCalendar.Identifier) -> Identifier {
+        if #available(macOS 10.10, iOS 8.0, *) {
             let identifierMap : [NSCalendar.Identifier : Identifier] =
                 [.gregorian : .gregorian,
                  .buddhist : .buddhist,
@@ -1128,3 +1128,35 @@ extension NSCalendar : _HasCustomAnyHashableRepresentation {
     }
 }
 
+extension Calendar : Codable {
+    private enum CodingKeys : Int, CodingKey {
+        case identifier
+        case locale
+        case timeZone
+        case firstWeekday
+        case minimumDaysInFirstWeek
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let identifierString = try container.decode(String.self, forKey: .identifier)
+        let identifier = Calendar._fromNSCalendarIdentifier(NSCalendar.Identifier(rawValue: identifierString))
+        self.init(identifier: identifier)
+
+        self.locale = try container.decodeIfPresent(Locale.self, forKey: .locale)
+        self.timeZone = try container.decode(TimeZone.self, forKey: .timeZone)
+        self.firstWeekday = try container.decode(Int.self, forKey: .firstWeekday)
+        self.minimumDaysInFirstWeek = try container.decode(Int.self, forKey: .minimumDaysInFirstWeek)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+
+        let identifier = Calendar._toNSCalendarIdentifier(self.identifier).rawValue
+        try container.encode(identifier, forKey: .identifier)
+        try container.encode(self.locale, forKey: .locale)
+        try container.encode(self.timeZone, forKey: .timeZone)
+        try container.encode(self.firstWeekday, forKey: .firstWeekday)
+        try container.encode(self.minimumDaysInFirstWeek, forKey: .minimumDaysInFirstWeek)
+    }
+}

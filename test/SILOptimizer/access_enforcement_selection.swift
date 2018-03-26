@@ -6,7 +6,7 @@
 public func takesInout(_ i: inout Int) {
   i = 42
 }
-// CHECK-LABEL: Access Enforcement Selection in _T028access_enforcement_selection10takesInoutySizF
+// CHECK-LABEL: Access Enforcement Selection in $S28access_enforcement_selection10takesInoutyySizF
 // CHECK: Static Access: %{{.*}} = begin_access [modify] [static] %{{.*}} : $*Int
 
 // Helper taking a basic, no-escape closure.
@@ -25,18 +25,14 @@ public func captureStack() -> Int {
   takeClosure { return x }
   return x
 }
-// CHECK-LABEL: Access Enforcement Selection in _T028access_enforcement_selection12captureStackSiyF
+// CHECK-LABEL: Access Enforcement Selection in $S28access_enforcement_selection12captureStackSiyF
 // Dynamic access for `return x`. Since the closure is non-escaping, using
 // dynamic enforcement here is more conservative than it needs to be -- static
 // is sufficient here.
-// CHECK: Dynamic Access: %{{.*}} = begin_access [read] [dynamic] %{{.*}} : $*Int
+// CHECK: Static Access: %{{.*}} = begin_access [read] [static] %{{.*}} : $*Int
 
-// The access inside the closure is dynamic, until we have the logic necessary to
-// prove that no other closures are passed to `takeClosure` that may write to
-// `x`.
-//
-// CHECK-LABEL: Access Enforcement Selection in _T028access_enforcement_selection12captureStackSiyFSiycfU_
-// CHECK: Dynamic Access: %{{.*}} = begin_access [read] [dynamic] %{{.*}} : $*Int
+// CHECK-LABEL: Access Enforcement Selection in $S28access_enforcement_selection12captureStackSiyFSiyXEfU_
+// CHECK: Static Access: %{{.*}} = begin_access [read] [static] %{{.*}} : $*Int
 
 
 // Generate an alloc_stack that does not escape into a closure.
@@ -45,11 +41,11 @@ public func nocaptureStack() -> Int {
   takeClosure { return 5 }
   return x
 }
-// CHECK-LABEL: Access Enforcement Selection in _T028access_enforcement_selection14nocaptureStackSiyF
+// CHECK-LABEL: Access Enforcement Selection in $S28access_enforcement_selection14nocaptureStackSiyF
 // Static access for `return x`.
 // CHECK: Static Access: %{{.*}} = begin_access [read] [static] %{{.*}} : $*Int
 //
-// CHECK-LABEL: Access Enforcement Selection in _T028access_enforcement_selection14nocaptureStackSiyFSiycfU_
+// CHECK-LABEL: Access Enforcement Selection in $S28access_enforcement_selection14nocaptureStackSiyFSiyXEfU_
 
 // Generate an alloc_stack that escapes into a closure while an access is
 // in progress.
@@ -59,27 +55,27 @@ public func captureStackWithInoutInProgress() -> Int {
   takeClosureAndInout(&x) { return x }
   return x
 }
-// CHECK-LABEL: Access Enforcement Selection in _T028access_enforcement_selection31captureStackWithInoutInProgressSiyF
-// Dynamic access for `&x`. This must be dynamic so that we catch the conflict
-// in the closure.
-// CHECK-DAG: Dynamic Access: %{{.*}} = begin_access [modify] [dynamic] %{{.*}} : $*Int
-// Dynamic access for `return x`. This is more conservative than it needs
-// to be; it can be static.
-// CHECK-DAG: Dynamic Access: %{{.*}} = begin_access [read] [dynamic] %{{.*}} : $*Int
+// CHECK-LABEL: Access Enforcement Selection in $S28access_enforcement_selection31captureStackWithInoutInProgressSiyF
+// Static access for `&x`.
+// CHECK-DAG: Static Access: %{{.*}} = begin_access [modify] [static] %{{.*}} : $*Int
+// Static access for `return x`.
+// CHECK-DAG: Static Access: %{{.*}} = begin_access [read] [static] %{{.*}} : $*Int
 //
-// CHECK-LABEL: Access Enforcement Selection in _T028access_enforcement_selection31captureStackWithInoutInProgressSiyFSiycfU_
-// CHECK: Dynamic Access: %{{.*}} = begin_access [read] [dynamic] %{{.*}} : $*Int
+// CHECK-LABEL: Access Enforcement Selection in $S28access_enforcement_selection31captureStackWithInoutInProgressSiyFSiyXEfU_
+// CHECK: Static Access: %{{.*}} = begin_access [read] [static] %{{.*}} : $*Int
 
 // Generate an alloc_box that escapes into a closure.
+// FIXME: `x` is eventually promoted to an alloc_stack even though it has dynamic enforcement.
+// We should ensure that alloc_stack variables are statically enforced.
 public func captureBox() -> Int {
   var x = 3
   takeEscapingClosure { x = 4; return x }
   return x
 }
-// CHECK-LABEL: Access Enforcement Selection in _T028access_enforcement_selection10captureBoxSiyF
+// CHECK-LABEL: Access Enforcement Selection in $S28access_enforcement_selection10captureBoxSiyF
 // Dynamic access for `return x`.
 // CHECK: Dynamic Access: %{{.*}} = begin_access [read] [dynamic] %{{.*}} : $*Int
-// CHECK-LABEL: _T028access_enforcement_selection10captureBoxSiyFSiycfU_
+// CHECK-LABEL: $S28access_enforcement_selection10captureBoxSiyFSiycfU_
 
 // Generate a closure in which the @inout_aliasing argument
 // escapes to an @inout function `bar`.
@@ -88,19 +84,17 @@ public func recaptureStack() -> Int {
   takeClosure { takesInout(&x); return x }
   return x
 }
-// CHECK-LABEL: Access Enforcement Selection in _T028access_enforcement_selection14recaptureStackSiyF
+// CHECK-LABEL: Access Enforcement Selection in $S28access_enforcement_selection14recaptureStackSiyF
 //
-// Dynamic access for `return x`. This is more conservative than it needs
-// to be; static is sufficient.
-// CHECK: Dynamic Access:   %{{.*}} = begin_access [read] [dynamic] %{{.*}} : $*Int
+// Static access for `return x`.
+// CHECK: Static Access:   %{{.*}} = begin_access [read] [static] %{{.*}} : $*Int
 
-// CHECK-LABEL: Access Enforcement Selection in _T028access_enforcement_selection14recaptureStackSiyFSiycfU_
+// CHECK-LABEL: Access Enforcement Selection in $S28access_enforcement_selection14recaptureStackSiyFSiyXEfU_
 //
-// The first [modify] access inside the closure must be dynamic. It enforces the
+// The first [modify] access inside the closure is static. It enforces the
 // @inout argument.
-// CHECK: Dynamic Access: %{{.*}} = begin_access [modify] [dynamic] %{{.*}} : $*Int
+// CHECK: Static Access: %{{.*}} = begin_access [modify] [static] %{{.*}} : $*Int
 //
-// The second [read] access is only dynamic because the analysis isn't strong
-// enough to prove otherwise. Same as `captureStack` above.
+// The second [read] access is static. Same as `captureStack` above.
 //
-// CHECK: Dynamic Access: %{{.*}} = begin_access [read] [dynamic] %{{.*}} : $*Int
+// CHECK: Static Access: %{{.*}} = begin_access [read] [static] %{{.*}} : $*Int

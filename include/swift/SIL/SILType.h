@@ -258,8 +258,10 @@ public:
   /// True if the type, or the referenced type of an address type, is trivial.
   bool isTrivial(SILModule &M) const;
 
-  /// True if the type, or the referenced type of an address type, is a
-  /// scalar reference-counted type.
+  /// True if the type, or the referenced type of an address type, is known to
+  /// be a scalar reference-counted type. If this is false, then some part of
+  /// the type may be opaque. It may become reference counted later after
+  /// specialization.
   bool isReferenceCounted(SILModule &M) const;
 
   /// Returns true if the referenced type is a function type that never
@@ -361,13 +363,16 @@ public:
   /// pointer.
   bool isPointerSizeAndAligned();
 
-  /// True if the layout of `fromType` is known to cover the layout of
-  /// `totype`. This is conservatively imprecise and is not
-  /// reflexive. `fromType` may be larger than the given type and still be
-  /// castable. It is the caller's responsibility to ensure that the overlapping
-  /// fields are layout compatible.
-  static bool canUnsafeCastValue(SILType fromType, SILType toType,
-                                 SILModule &M);
+  /// Return true if the layout of `toType` is an ABI compatible prefix of
+  /// `fromType` ignoring reference types. `fromType` may be larger than
+  /// `toType` and still be unsafe castable. `fromType` may contain references
+  /// in positions where `toType` does not contain references and still be
+  /// unsafe castable. This is used solely to determine whether an address cast
+  /// can be promoted to a cast between aggregates of scalar values without
+  /// confusing IRGen.
+  static bool canPerformABICompatibleUnsafeCastValue(SILType fromType,
+                                                     SILType toType,
+                                                     SILModule &M);
 
   /// True if `operTy` can be cast by single-reference value into `resultTy`.
   static bool canRefCast(SILType operTy, SILType resultTy, SILModule &M);
@@ -377,7 +382,7 @@ public:
   bool isBlockPointerCompatible() const {
     // Look through one level of optionality.
     SILType ty = *this;
-    if (auto optPayload = ty.getAnyOptionalObjectType()) {
+    if (auto optPayload = ty.getOptionalObjectType()) {
       ty = optPayload;
     }
       
@@ -426,6 +431,12 @@ public:
                                                         Ty.getSwiftRValueType());
   }
 
+  /// Look through reference-storage types on this type.
+  SILType getReferenceStorageReferentType() const {
+    return SILType(getSwiftRValueType().getReferenceStorageReferent(),
+                   getCategory());
+  }
+
   /// Transform the function type SILType by replacing all of its interface
   /// generic args with the appropriate item from the substitution.
   ///
@@ -470,7 +481,7 @@ public:
 
   /// Returns the lowered type for T if this type is Optional<T>;
   /// otherwise, return the null type.
-  SILType getAnyOptionalObjectType() const;
+  SILType getOptionalObjectType() const;
 
   /// Unwraps one level of optional type.
   /// Returns the lowered T if the given type is Optional<T>.
@@ -495,6 +506,10 @@ public:
   /// check whether they have an abstraction difference.
   bool hasAbstractionDifference(SILFunctionTypeRepresentation rep,
                                 SILType type2);
+
+  /// Returns true if this SILType could be potentially a lowering of the given
+  /// formal type. Meant for verification purposes/assertions.
+  bool isLoweringOf(SILModule &M, CanType formalType);
 
   /// Returns the hash code for the SILType.
   llvm::hash_code getHashCode() const {
@@ -526,6 +541,9 @@ public:
 
   /// Get the standard exception type.
   static SILType getExceptionType(const ASTContext &C);
+
+  /// Get the SIL token type.
+  static SILType getSILTokenType(const ASTContext &C);
 
   //
   // Utilities for treating SILType as a pointer-like type.
@@ -560,11 +578,10 @@ NON_SIL_TYPE(AnyFunction)
 NON_SIL_TYPE(LValue)
 #undef NON_SIL_TYPE
 
-CanSILFunctionType getNativeSILFunctionType(SILModule &M,
-                        Lowering::AbstractionPattern orig,
-                        CanAnyFunctionType substInterface,
-                        Optional<SILDeclRef> constant = None,
-                        SILDeclRef::Kind kind = SILDeclRef::Kind::Func);
+CanSILFunctionType getNativeSILFunctionType(
+    SILModule &M, Lowering::AbstractionPattern origType,
+    CanAnyFunctionType substType, Optional<SILDeclRef> constant = None,
+    Optional<ProtocolConformanceRef> witnessMethodConformance = None);
 
 inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, SILType T) {
   T.print(OS);
@@ -598,7 +615,7 @@ namespace llvm {
 // Allow the low bit of SILType to be used for nefarious purposes, e.g. putting
 // a SILType into a PointerUnion.
 template<>
-class PointerLikeTypeTraits<swift::SILType> {
+struct PointerLikeTypeTraits<swift::SILType> {
 public:
   static inline void *getAsVoidPointer(swift::SILType T) {
     return T.getOpaqueValue();

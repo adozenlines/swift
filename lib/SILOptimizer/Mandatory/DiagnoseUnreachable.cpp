@@ -143,7 +143,7 @@ static void propagateBasicBlockArgs(SILBasicBlock &BB) {
     }
 
     // After the first branch is processed, the arguments vector is populated.
-    assert(Args.size() > 0);
+    assert(!Args.empty());
     checkArgs = true;
   }
 
@@ -192,11 +192,10 @@ static bool constantFoldTerminator(SILBasicBlock &BB,
   // Process conditional branches with constant conditions.
   if (auto *CBI = dyn_cast<CondBranchInst>(TI)) {
     SILValue V = CBI->getCondition();
-    auto *CondI = dyn_cast<SILInstruction>(V);
     SILLocation Loc = CBI->getLoc();
 
     if (IntegerLiteralInst *ConstCond =
-          dyn_cast_or_null<IntegerLiteralInst>(CondI)) {
+          dyn_cast_or_null<IntegerLiteralInst>(V)) {
       SILBuilderWithScope B(&BB, CBI);
 
       // Determine which of the successors is unreachable and create a new
@@ -399,18 +398,20 @@ static bool isUserCode(const SILInstruction *I) {
 }
 
 static void setOutsideBlockUsesToUndef(SILInstruction *I) {
-  if (I->use_empty())
-      return;
+  if (!I->hasUsesOfAnyResult())
+    return;
 
   SILBasicBlock *BB = I->getParent();
   SILModule &Mod = BB->getModule();
 
   // Replace all uses outside of I's basic block by undef.
-  llvm::SmallVector<Operand *, 16> Uses(I->use_begin(), I->use_end());
+  llvm::SmallVector<Operand *, 16> Uses;
+  for (auto result : I->getResults())
+    Uses.append(result->use_begin(), result->use_end());
+
   for (auto *Use : Uses)
-    if (auto *User = dyn_cast<SILInstruction>(Use->getUser()))
-      if (User->getParent() != BB)
-        Use->set(SILUndef::get(Use->get()->getType(), Mod));
+    if (Use->getUser()->getParent() != BB)
+      Use->set(SILUndef::get(Use->get()->getType(), Mod));
 }
 
 static SILInstruction *getAsCallToNoReturn(SILInstruction *I) {
@@ -541,13 +542,17 @@ static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
     }
   }
 
+  auto *Scope = NoReturnCall->getDebugScope();
   recursivelyDeleteTriviallyDeadInstructions(ToBeDeleted, true);
   NumInstructionsRemoved += ToBeDeleted.size();
 
   // Add an unreachable terminator. The terminator has an invalid source
   // location to signal to the DataflowDiagnostic pass that this code does
   // not correspond to user code.
+  // Share the scope with the preceding BB. This causes the debug info to be
+  // much smaller and easier to read, but otherwise has no effect.
   SILBuilder B(&BB);
+  B.setCurrentDebugScope(Scope);
   B.createUnreachable(ArtificialUnreachableLocation());
 
   return true;
@@ -727,70 +732,73 @@ static bool removeUnreachableBlocks(SILFunction &F, SILModule &M,
 /// diagnose any user code after it as being unreachable.  This pass happens
 /// before the definite initialization pass so that it doesn't see infeasible
 /// control flow edges.
-static void performNoReturnFunctionProcessing(SILModule *M,
-                                              SILModuleTransform *T) {
-  for (auto &Fn : *M) {
-    DEBUG(llvm::errs() << "*** No return function processing: "
-          << Fn.getName() << "\n");
-    
-    for (auto &BB : Fn) {
-      // Remove instructions from the basic block after a call to a noreturn
-      // function.
-      simplifyBlocksWithCallsToNoReturn(BB, nullptr);
-    }
-    T->invalidateAnalysis(&Fn, SILAnalysis::InvalidationKind::FunctionBody);
+static void performNoReturnFunctionProcessing(SILFunction &Fn,
+                                              SILFunctionTransform *T) {
+  DEBUG(llvm::errs() << "*** No return function processing: " << Fn.getName()
+                     << "\n");
+
+  for (auto &BB : Fn) {
+    // Remove instructions from the basic block after a call to a noreturn
+    // function.
+    simplifyBlocksWithCallsToNoReturn(BB, nullptr);
   }
+  T->invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
 }
 
-void swift::performSILDiagnoseUnreachable(SILModule *M, SILModuleTransform *T) {
-  for (auto &Fn : *M) {
-    DEBUG(llvm::errs() << "*** Diagnose Unreachable processing: "
-          << Fn.getName() << "\n");
+static void diagnoseUnreachable(SILFunction &Fn) {
+  DEBUG(llvm::errs() << "*** Diagnose Unreachable processing: " << Fn.getName()
+                     << "\n");
 
-    UnreachableUserCodeReportingState State;
+  UnreachableUserCodeReportingState State;
 
-    for (auto &BB : Fn) {
-      // Simplify the blocks with terminators that rely on constant conditions.
-      if (constantFoldTerminator(BB, &State))
-        continue;
+  for (auto &BB : Fn) {
+    // Simplify the blocks with terminators that rely on constant conditions.
+    if (constantFoldTerminator(BB, &State))
+      continue;
 
-      // Remove instructions from the basic block after a call to a noreturn
-      // function.
-      if (simplifyBlocksWithCallsToNoReturn(BB, &State))
-        continue;
-    }
-
-    // Remove unreachable blocks.
-    removeUnreachableBlocks(Fn, *M, &State);
-
-    for (auto &BB : Fn) {
-      propagateBasicBlockArgs(BB);
-    }
-
-    for (auto &BB : Fn) {
-      // Simplify the blocks with terminators that rely on constant conditions.
-      if (constantFoldTerminator(BB, &State)) {
-        continue;
-      }
-      // Remove instructions from the basic block after a call to a noreturn
-      // function.
-      if (simplifyBlocksWithCallsToNoReturn(BB, &State))
-        continue;
-    }
-
-    // Remove unreachable blocks.
-    removeUnreachableBlocks(Fn, *M, &State);
-
-    if (T)
-      T->invalidateAnalysis(&Fn, SILAnalysis::InvalidationKind::FunctionBody);
+    // Remove instructions from the basic block after a call to a noreturn
+    // function.
+    if (simplifyBlocksWithCallsToNoReturn(BB, &State))
+      continue;
   }
+
+  // Remove unreachable blocks.
+  removeUnreachableBlocks(Fn, Fn.getModule(), &State);
+
+  for (auto &BB : Fn) {
+    propagateBasicBlockArgs(BB);
+  }
+
+  for (auto &BB : Fn) {
+    // Simplify the blocks with terminators that rely on constant conditions.
+    if (constantFoldTerminator(BB, &State)) {
+      continue;
+    }
+    // Remove instructions from the basic block after a call to a noreturn
+    // function.
+    if (simplifyBlocksWithCallsToNoReturn(BB, &State))
+      continue;
+  }
+
+  // Remove unreachable blocks.
+  removeUnreachableBlocks(Fn, Fn.getModule(), &State);
+}
+
+// External entry point for other passes, which must do their own invalidation.
+void swift::performSILDiagnoseUnreachable(SILModule *M) {
+  for (auto &Fn : *M)
+    diagnoseUnreachable(Fn);
 }
 
 namespace {
-  class NoReturnFolding : public SILModuleTransform {
-    void run() override {
-      performNoReturnFunctionProcessing(getModule(), this);
-    }
+class NoReturnFolding : public SILFunctionTransform {
+  void run() override {
+    // Don't rerun diagnostics on deserialized functions.
+    if (getFunction()->wasDeserializedCanonical())
+      return;
+
+    performNoReturnFunctionProcessing(*getFunction(), this);
+  }
   };
 } // end anonymous namespace
 
@@ -800,10 +808,13 @@ SILTransform *swift::createNoReturnFolding() {
 
 
 namespace {
-  class DiagnoseUnreachable : public SILModuleTransform {
-    void run() override {
-      performSILDiagnoseUnreachable(getModule(), this);
-    }
+// This pass reruns on deserialized SIL because diagnostic constant propagation
+// can expose unreachable blocks which are then removed by this pass.
+class DiagnoseUnreachable : public SILFunctionTransform {
+  void run() override {
+    diagnoseUnreachable(*getFunction());
+    invalidateAnalysis(SILAnalysis::InvalidationKind::FunctionBody);
+  }
   };
 } // end anonymous namespace
 

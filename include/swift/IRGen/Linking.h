@@ -14,6 +14,7 @@
 #define SWIFT_IRGEN_LINKING_H
 
 #include "swift/AST/Decl.h"
+#include "swift/AST/ProtocolAssociations.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/Types.h"
 #include "swift/IRGen/ValueWitness.h"
@@ -36,12 +37,29 @@ bool useDllStorage(const llvm::Triple &triple);
 
 class UniversalLinkageInfo {
 public:
-  bool IsELFObject, UseDLLStorage, HasMultipleIGMs, IsWholeModule;
+  bool IsELFObject;
+  bool UseDLLStorage;
+
+  /// True iff are multiple llvm modules.
+  bool HasMultipleIGMs;
+
+  bool IsWholeModule;
 
   UniversalLinkageInfo(IRGenModule &IGM);
 
   UniversalLinkageInfo(const llvm::Triple &triple, bool hasMultipleIGMs,
                        bool isWholeModule);
+
+  /// In case of multiple llvm modules (in multi-threaded compilation) all
+  /// private decls must be visible from other files.
+  bool shouldAllPrivateDeclsBeVisibleFromOtherFiles() const {
+    return HasMultipleIGMs;
+  }
+  /// In case of multipe llvm modules, private lazy protocol
+  /// witness table accessors could be emitted by two different IGMs during
+  /// IRGen into different object files and the linker would complain about
+  /// duplicate symbols.
+  bool needLinkerToMergeDuplicateSymbols() const { return HasMultipleIGMs; }
 };
 
 /// Selector for type metadata symbol kinds.
@@ -72,12 +90,8 @@ class LinkEntity {
     // This field appears in the ValueWitness kind.
     ValueWitnessShift = 8, ValueWitnessMask = 0xFF00,
 
-    // These fields appear in the FieldOffset kind.
-    IsIndirectShift = 8, IsIndirectMask = 0x0100,
-
-    // These fields appear in the TypeMetadata kind.
+    // This field appears in the TypeMetadata kind.
     MetadataAddressShift = 8, MetadataAddressMask = 0x0300,
-    IsPatternShift = 10, IsPatternMask = 0x0400,
 
     // This field appears in associated type access functions.
     AssociatedTypeIndexShift = 8, AssociatedTypeIndexMask = ~KindMask,
@@ -90,9 +104,20 @@ class LinkEntity {
 #define LINKENTITY_GET_FIELD(value, field) ((value & field##Mask) >> field##Shift)
 
   enum class Kind {
-    /// A function.
-    /// The pointer is a FuncDecl*.
-    Function,
+    /// A method dispatch thunk.  The pointer is a FuncDecl* inside a protocol
+    /// or a class.
+    DispatchThunk,
+
+    /// A method dispatch thunk for an initializing constructor.  The pointer
+    /// is a ConstructorDecl* inside a class.
+    DispatchThunkInitializer,
+
+    /// A method dispatch thunk for an allocating constructor.  The pointer is a
+    /// ConstructorDecl* inside a protocol or a class.
+    DispatchThunkAllocator,
+
+    /// A resilient enum tag index. The pointer is a EnumElementDecl*.
+    EnumCase,
 
     /// A field offset.  The pointer is a VarDecl*.
     FieldOffset,
@@ -109,24 +134,58 @@ class LinkEntity {
     /// A swift metaclass-stub reference.  The pointer is a ClassDecl*.
     SwiftMetaclassStub,
 
+    /// A class metadata base offset global variable.  This stores the offset
+    /// of the immediate members of a class (generic parameters, field offsets,
+    /// vtable offsets) in the class's metadata.  The immediate members begin
+    /// immediately after the superclass members end.
+    ///
+    /// The pointer is a ClassDecl*.
+    ClassMetadataBaseOffset,
+
+    /// The property descriptor for a public property or subscript.
+    /// The pointer is an AbstractStorageDecl*.
+    PropertyDescriptor,
+
     /// The nominal type descriptor for a nominal type.
     /// The pointer is a NominalTypeDecl*.
     NominalTypeDescriptor,
 
+    /// The metadata pattern for a generic nominal type.
+    /// The pointer is a NominalTypeDecl*.
+    TypeMetadataPattern,
+
+    /// The instantiation cache for a generic nominal type.
+    /// The pointer is a NominalTypeDecl*.
+    TypeMetadataInstantiationCache,
+
+    /// The instantiation function for a generic nominal type.
+    /// The pointer is a NominalTypeDecl*.
+    TypeMetadataInstantiationFunction,
+
+    /// The completion function for a generic or resilient nominal type.
+    /// The pointer is a NominalTypeDecl*.
+    TypeMetadataCompletionFunction,
+
+    /// The module descriptor for a module.
+    /// The pointer is a ModuleDecl*.
+    ModuleDescriptor,
+    
     /// The protocol descriptor for a protocol type.
     /// The pointer is a ProtocolDecl*.
     ProtocolDescriptor,
 
-    /// Some other kind of declaration.
-    /// The pointer is a Decl*.
-    Other,
-
-    /// A reflection metadata descriptor for the superclass of a class.
-    ReflectionSuperclassDescriptor,
-
     /// A SIL function. The pointer is a SILFunction*.
     SILFunction,
 
+    /// The descriptor for an extension.
+    /// The pointer is an ExtensionDecl*.
+    ExtensionDescriptor,
+    
+    /// The descriptor for a runtime-anonymous context.
+    /// The pointer is the DeclContext* of a child of the context that should
+    /// be considered private.
+    AnonymousDescriptor,
+    
     /// A SIL global variable. The pointer is a SILGlobalVariable*.
     SILGlobalVariable,
 
@@ -162,6 +221,10 @@ class LinkEntity {
     /// A reflection metadata descriptor for the associated type witnesses of a
     /// nominal type in a protocol conformance.
     ReflectionAssociatedTypeDescriptor,
+
+    /// The protocol conformance descriptor for a conformance.
+    /// The pointer is a NormalProtocolConformance*.
+    ProtocolConformanceDescriptor,
 
     // These are both type kinds and protocol-conformance kinds.
 
@@ -206,24 +269,18 @@ class LinkEntity {
 
     /// A reflection metadata descriptor for a struct, enum, class or protocol.
     ReflectionFieldDescriptor,
+
+    /// A coroutine continuation prototype function.
+    CoroutineContinuationPrototype,
   };
   friend struct llvm::DenseMapInfo<LinkEntity>;
-
-  static bool isFunction(ValueDecl *decl) {
-    return (isa<FuncDecl>(decl) || isa<EnumElementDecl>(decl) ||
-            isa<ConstructorDecl>(decl));
-  }
-
-  static bool hasGetterSetter(ValueDecl *decl) {
-    return (isa<VarDecl>(decl) || isa<SubscriptDecl>(decl));
-  }
 
   Kind getKind() const {
     return Kind(LINKENTITY_GET_FIELD(Data, Kind));
   }
 
   static bool isDeclKind(Kind k) {
-    return k <= Kind::ReflectionSuperclassDescriptor;
+    return k <= Kind::ProtocolDescriptor;
   }
   static bool isTypeKind(Kind k) {
     return k >= Kind::ProtocolWitnessTableLazyAccessFunction;
@@ -312,8 +369,8 @@ class LinkEntity {
                                                 CanType associatedType,
                                                 ProtocolDecl *requirement) {
     unsigned index = 0;
-    for (auto &reqt : conformance->getProtocol()->getRequirementSignature()
-                                                ->getRequirements()) {
+    for (const auto &reqt :
+           conformance->getProtocol()->getRequirementSignature()) {
       if (reqt.getKind() == RequirementKind::Conformance &&
           reqt.getFirstType()->getCanonicalType() == associatedType &&
           reqt.getSecondType()->castTo<ProtocolType>()->getDecl() ==
@@ -328,9 +385,7 @@ class LinkEntity {
   static std::pair<CanType, ProtocolDecl*>
   getAssociatedConformanceByIndex(const ProtocolConformance *conformance,
                                   unsigned index) {
-    auto &reqt =
-      conformance->getProtocol()->getRequirementSignature()
-                                ->getRequirements()[index];
+    auto &reqt = conformance->getProtocol()->getRequirementSignature()[index];
     assert(reqt.getKind() == RequirementKind::Conformance);
     return { reqt.getFirstType()->getCanonicalType(),
              reqt.getSecondType()->castTo<ProtocolType>()->getDecl() };
@@ -346,20 +401,45 @@ class LinkEntity {
   LinkEntity() = default;
 
 public:
-  static LinkEntity forNonFunction(ValueDecl *decl) {
-    assert(!isFunction(decl));
+  static LinkEntity forDispatchThunk(SILDeclRef declRef) {
+    assert(!declRef.isForeign &&
+           !declRef.isDirectReference &&
+           !declRef.isCurried);
+
+    LinkEntity::Kind kind;
+
+    auto *decl = declRef.getDecl();
+    assert(isa<ClassDecl>(decl->getDeclContext()) ||
+           isa<ProtocolDecl>(decl->getDeclContext()));
+
+    switch (declRef.kind) {
+    case SILDeclRef::Kind::Func:
+      kind = Kind::DispatchThunk;
+      break;
+    case SILDeclRef::Kind::Initializer:
+      kind = Kind::DispatchThunkInitializer;
+      break;
+    case SILDeclRef::Kind::Allocator:
+      kind = Kind::DispatchThunkAllocator;
+      break;
+    default:
+      llvm_unreachable("Bad SILDeclRef for dispatch thunk");
+    }
 
     LinkEntity entity;
-    entity.setForDecl(Kind::Other, decl);
+    entity.setForDecl(kind, decl);
     return entity;
   }
 
-  static LinkEntity forFieldOffset(VarDecl *decl, bool isIndirect) {
+  static LinkEntity forFieldOffset(VarDecl *decl) {
     LinkEntity entity;
-    entity.Pointer = decl;
-    entity.SecondaryPointer = nullptr;
-    entity.Data = LINKENTITY_SET_FIELD(Kind, unsigned(Kind::FieldOffset))
-                | LINKENTITY_SET_FIELD(IsIndirect, unsigned(isIndirect));
+    entity.setForDecl(Kind::FieldOffset, decl);
+    return entity;
+  }
+
+  static LinkEntity forEnumCase(EnumElementDecl *decl) {
+    LinkEntity entity;
+    entity.setForDecl(Kind::EnumCase, decl);
     return entity;
   }
 
@@ -388,20 +468,42 @@ public:
   }
 
   static LinkEntity forTypeMetadata(CanType concreteType,
-                                    TypeMetadataAddress addr,
-                                    bool isPattern) {
+                                    TypeMetadataAddress addr) {
     LinkEntity entity;
     entity.Pointer = concreteType.getPointer();
     entity.SecondaryPointer = nullptr;
     entity.Data = LINKENTITY_SET_FIELD(Kind, unsigned(Kind::TypeMetadata))
-                | LINKENTITY_SET_FIELD(MetadataAddress, unsigned(addr))
-                | LINKENTITY_SET_FIELD(IsPattern, unsigned(isPattern));
+                | LINKENTITY_SET_FIELD(MetadataAddress, unsigned(addr));
+    return entity;
+  }
+
+  static LinkEntity forTypeMetadataPattern(NominalTypeDecl *decl) {
+    LinkEntity entity;
+    entity.setForDecl(Kind::TypeMetadataPattern, decl);
     return entity;
   }
 
   static LinkEntity forTypeMetadataAccessFunction(CanType type) {
     LinkEntity entity;
     entity.setForType(Kind::TypeMetadataAccessFunction, type);
+    return entity;
+  }
+
+  static LinkEntity forTypeMetadataInstantiationCache(NominalTypeDecl *decl) {
+    LinkEntity entity;
+    entity.setForDecl(Kind::TypeMetadataInstantiationCache, decl);
+    return entity;
+  }
+
+  static LinkEntity forTypeMetadataInstantiationFunction(NominalTypeDecl *decl){
+    LinkEntity entity;
+    entity.setForDecl(Kind::TypeMetadataInstantiationFunction, decl);
+    return entity;
+  }
+
+  static LinkEntity forTypeMetadataCompletionFunction(NominalTypeDecl *decl) {
+    LinkEntity entity;
+    entity.setForDecl(Kind::TypeMetadataCompletionFunction, decl);
     return entity;
   }
 
@@ -417,9 +519,45 @@ public:
     return entity;
   }
 
+  static LinkEntity forClassMetadataBaseOffset(ClassDecl *decl) {
+    LinkEntity entity;
+    entity.setForDecl(Kind::ClassMetadataBaseOffset, decl);
+    return entity;
+  }
+
   static LinkEntity forNominalTypeDescriptor(NominalTypeDecl *decl) {
     LinkEntity entity;
     entity.setForDecl(Kind::NominalTypeDescriptor, decl);
+    return entity;
+  }
+
+  static LinkEntity forPropertyDescriptor(AbstractStorageDecl *decl) {
+    LinkEntity entity;
+    entity.setForDecl(Kind::PropertyDescriptor, decl);
+    return entity;
+  }
+
+  static LinkEntity forModuleDescriptor(ModuleDecl *decl) {
+    LinkEntity entity;
+    entity.setForDecl(Kind::ModuleDescriptor, decl);
+    return entity;
+  }
+
+  static LinkEntity forExtensionDescriptor(ExtensionDecl *decl) {
+    LinkEntity entity;
+    entity.Pointer = const_cast<void*>(static_cast<const void*>(decl));
+    entity.SecondaryPointer = nullptr;
+    entity.Data =
+      LINKENTITY_SET_FIELD(Kind, unsigned(Kind::ExtensionDescriptor));
+    return entity;
+  }
+
+  static LinkEntity forAnonymousDescriptor(DeclContext *dc) {
+    LinkEntity entity;
+    entity.Pointer = const_cast<void*>(static_cast<const void*>(dc));
+    entity.SecondaryPointer = nullptr;
+    entity.Data =
+      LINKENTITY_SET_FIELD(Kind, unsigned(Kind::AnonymousDescriptor));
     return entity;
   }
 
@@ -511,21 +649,22 @@ public:
 
   static LinkEntity
   forAssociatedTypeMetadataAccessFunction(const ProtocolConformance *C,
-                                          AssociatedTypeDecl *associate) {
+                                          AssociatedType association) {
     LinkEntity entity;
     entity.setForProtocolConformanceAndAssociatedType(
-                     Kind::AssociatedTypeMetadataAccessFunction, C, associate);
+                     Kind::AssociatedTypeMetadataAccessFunction, C,
+                     association.getAssociation());
     return entity;
   }
 
   static LinkEntity
   forAssociatedTypeWitnessTableAccessFunction(const ProtocolConformance *C,
-                                              CanType associatedType,
-                                              ProtocolDecl *associatedProtocol){
+                                     const AssociatedConformance &association) {
     LinkEntity entity;
     entity.setForProtocolConformanceAndAssociatedConformance(
                      Kind::AssociatedTypeWitnessTableAccessFunction, C,
-                     associatedType, associatedProtocol);
+                     association.getAssociation(),
+                     association.getAssociatedRequirement());
     return entity;
   }
 
@@ -550,12 +689,18 @@ public:
   }
 
   static LinkEntity
-  forReflectionSuperclassDescriptor(const ClassDecl *decl) {
+  forProtocolConformanceDescriptor(const NormalProtocolConformance *C) {
     LinkEntity entity;
-    entity.setForDecl(Kind::ReflectionSuperclassDescriptor, decl);
+    entity.setForProtocolConformance(
+        Kind::ProtocolConformanceDescriptor, C);
     return entity;
   }
 
+  static LinkEntity forCoroutineContinuationPrototype(CanSILFunctionType type) {
+    LinkEntity entity;
+    entity.setForType(Kind::CoroutineContinuationPrototype, type);
+    return entity;
+  }
 
   void mangle(llvm::raw_ostream &out) const;
   void mangle(SmallVectorImpl<char> &buffer) const;
@@ -567,29 +712,24 @@ public:
   ///
   bool isAvailableExternally(IRGenModule &IGM) const;
 
-  /// Returns true if this function or global variable may be inlined into
-  /// another module.
-  ///
-  bool isFragile(ForDefinition_t isDefinition) const;
-
   const ValueDecl *getDecl() const {
     assert(isDeclKind(getKind()));
     return reinterpret_cast<ValueDecl*>(Pointer);
   }
   
+  const ExtensionDecl *getExtension() const {
+    assert(getKind() == Kind::ExtensionDescriptor);
+    return reinterpret_cast<ExtensionDecl*>(Pointer);
+  }
+
+  const DeclContext *getDeclContext() const {
+    assert(getKind() == Kind::AnonymousDescriptor);
+    return reinterpret_cast<DeclContext*>(Pointer);
+  }
+
   SILFunction *getSILFunction() const {
     assert(getKind() == Kind::SILFunction);
     return reinterpret_cast<SILFunction*>(Pointer);
-  }
-
-  /// Returns true if this function is only serialized, but not necessarily
-  /// code-gen'd. These are fragile transparent functions.
-  bool isSILOnly() const {
-    if (getKind() != Kind::SILFunction)
-      return false;
-
-    SILFunction *F = getSILFunction();
-    return F->isTransparent() && F->isDefinition() && F->isSerialized();
   }
 
   SILGlobalVariable *getSILGlobalVariable() const {
@@ -632,17 +772,11 @@ public:
     assert(getKind() == Kind::TypeMetadata);
     return (TypeMetadataAddress)LINKENTITY_GET_FIELD(Data, MetadataAddress);
   }
-  bool isMetadataPattern() const {
-    assert(getKind() == Kind::TypeMetadata);
-    return LINKENTITY_GET_FIELD(Data, IsPattern);
-  }
   bool isForeignTypeMetadataCandidate() const {
     return getKind() == Kind::ForeignTypeMetadataCandidate;
   }
-
-  bool isOffsetIndirect() const {
-    assert(getKind() == Kind::FieldOffset);
-    return LINKENTITY_GET_FIELD(Data, IsIndirect);
+  bool isObjCClassRef() const {
+    return getKind() == Kind::ObjCClassRef;
   }
 
   /// Determine whether this entity will be weak-imported.
@@ -651,9 +785,12 @@ public:
         getSILGlobalVariable()->getDecl())
       return getSILGlobalVariable()->getDecl()->isWeakImported(module);
 
-    if (getKind() == Kind::SILFunction)
+    if (getKind() == Kind::SILFunction) {
       if (auto clangOwner = getSILFunction()->getClangNodeOwner())
         return clangOwner->isWeakImported(module);
+      if (getSILFunction()->isWeakLinked())
+        return getSILFunction()->isAvailableExternally();
+    }
 
     if (!isDeclKind(getKind()))
       return false;
@@ -682,6 +819,12 @@ public:
 
   static LinkInfo get(IRGenModule &IGM, const LinkEntity &entity,
                       ForDefinition_t forDefinition);
+  
+  static LinkInfo get(const UniversalLinkageInfo &linkInfo,
+                      StringRef name,
+                      SILLinkage linkage,
+                      ForDefinition_t isDefinition,
+                      bool isWeakImported);
 
   StringRef getName() const {
     return Name.str();

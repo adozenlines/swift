@@ -41,7 +41,7 @@ String(4.0)  // CHECK: String = "4.0"
 
 123 .
 hashValue
-// CHECK: Int = 123{{$}}
+// CHECK: Int = {{-?[0-9]+$}}
 
 // Check that we handle unmatched parentheses in REPL.
 1+1)
@@ -148,7 +148,7 @@ for c in "foobar".unicodeScalars { print(c) }
 // CHECK-NEXT: r
 
 var vec = Array<String>()
-// CHECK: vec : Array<String> = []
+// CHECK: vec : [String] = []
 
 // Error recovery
 var a : [int]

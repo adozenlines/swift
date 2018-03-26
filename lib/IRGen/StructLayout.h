@@ -219,9 +219,9 @@ public:
 class StructLayoutBuilder {
 protected:
   IRGenModule &IGM;
-private:
   SmallVector<llvm::Type*, 8> StructFields;
   Size CurSize = Size(0);
+private:
   Alignment CurAlignment = Alignment(1);
   SpareBitVector CurSpareBits;
   unsigned NextNonFixedOffsetIndex = 0;
@@ -233,9 +233,12 @@ public:
   StructLayoutBuilder(IRGenModule &IGM) : IGM(IGM) {}
 
   /// Add a swift heap header to the layout.  This must be the first
-  /// call to the layout.
+  /// thing added to the layout.
   void addHeapHeader();
-
+  /// Add the NSObject object header to the layout. This must be the first
+  /// thing added to the layout.
+  void addNSObjectHeader();
+  
   /// Add a number of fields to the layout.  The field layouts need
   /// only have the TypeInfo set; the rest will be filled out.
   ///
@@ -243,6 +246,13 @@ public:
   /// requirements of the layout.
   bool addFields(llvm::MutableArrayRef<ElementLayout> fields,
                  LayoutStrategy strategy);
+
+  /// Add a field to the layout.  The field layout needs
+  /// only have the TypeInfo set; the rest will be filled out.
+  ///
+  /// Returns true if the field may have increased the storage
+  /// requirements of the layout.
+  bool addField(ElementLayout &elt, LayoutStrategy strategy);
 
   /// Return whether the layout is known to be empty.
   bool empty() const { return IsFixedLayout && CurSize == Size(0); }
@@ -385,8 +395,6 @@ public:
                      const llvm::Twine &name = "") const;
 };
 
-Size getHeapHeaderSize(IRGenModule &IGM);
-
 /// Different policies for accessing a physical field.
 enum class FieldAccess : uint8_t {
   /// Instance variable offsets are constant.
@@ -398,12 +406,7 @@ enum class FieldAccess : uint8_t {
   
   /// Instance variable offsets are kept in fields in metadata, but
   /// the offsets of those fields within the metadata are constant.
-  ConstantIndirect,
-  
-  /// Instance variable offsets are kept in fields in metadata, and
-  /// the offsets of those fields within the metadata must be loaded
-  /// from "indirect offset" global variables.
-  NonConstantIndirect
+  ConstantIndirect
 };
 
 struct ClassLayout {

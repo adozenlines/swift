@@ -24,6 +24,7 @@
 #include <cassert>
 #include <cstdint>
 #include "llvm/ADT/StringRef.h"
+#include "swift/Runtime/Config.h"
 
 namespace llvm {
   class raw_ostream;
@@ -206,6 +207,8 @@ public:
 
   // Only to be used by the demangler parsers.
   void addChild(NodePointer Child, NodeFactory &Factory);
+  // Only to be used by the demangler parsers.
+  void removeChildAt(unsigned Pos, NodeFactory &factory);
 
   // Reverses the order of children.
   void reverseChildren(size_t StartingAt = 0);
@@ -216,10 +219,64 @@ public:
   void dump();
 };
 
+/// Returns the length of the swift mangling prefix of the \p SymbolName.
+///
+/// Returns 0 if \p SymbolName is not a mangled swift (>= swift 4.x) name.
+int getManglingPrefixLength(llvm::StringRef mangledName);
+
+/// Returns true if \p SymbolName is a mangled swift name.
+///
+/// This does not include the old (<= swift 3.x) mangling prefix "_T".
+inline bool isMangledName(llvm::StringRef mangledName) {
+  return getManglingPrefixLength(mangledName) != 0;
+}
+
 /// Returns true if the mangledName starts with the swift mangling prefix.
 ///
-/// \param mangledName A null-terminated string containing a mangled name.
+/// This includes the old (<= swift 3.x) mangling prefix "_T".
+bool isSwiftSymbol(llvm::StringRef mangledName);
+
+/// Returns true if the mangledName starts with the swift mangling prefix.
+///
+/// This includes the old (<= swift 3.x) mangling prefix "_T".
 bool isSwiftSymbol(const char *mangledName);
+
+/// Drops the Swift mangling prefix from the given mangled name, if there is
+/// one.
+///
+/// This does not include the old (<= swift 3.x) mangling prefix "_T".
+llvm::StringRef dropSwiftManglingPrefix(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is an alias type name.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isAlias(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is a class type name.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isClass(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is an enum type name.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isEnum(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is a protocol type name.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isProtocol(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name is a structure type name.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isStruct(llvm::StringRef mangledName);
+
+/// Returns true if the mangled name has the old scheme of function type
+/// mangling where labels are part of the type.
+///
+/// \param mangledName A null-terminated string containing a mangled name.
+bool isOldFunctionTypeMangling(llvm::StringRef mangledName);
 
 class Demangler;
 
@@ -252,8 +309,8 @@ public:
 
   /// Demangle the given symbol and return the parse tree.
   ///
-  /// \param MangledName The mangled symbol string, which start with the
-  /// mangling prefix _T.
+  /// \param MangledName The mangled symbol string, which start a mangling
+  /// prefix: _T, _T0, $S, _$S.
   ///
   /// \returns A parse tree for the demangled string - or a null pointer
   /// on failure.
@@ -263,8 +320,8 @@ public:
 
   /// Demangle the given type and return the parse tree.
   ///
-  /// \param MangledName The mangled type string, which does _not_ start with
-  /// the mangling prefix _T.
+  /// \param MangledName The mangled symbol string, which start a mangling
+  /// prefix: _T, _T0, $S, _$S.
   ///
   /// \returns A parse tree for the demangled string - or a null pointer
   /// on failure.
@@ -274,8 +331,8 @@ public:
   
   /// Demangle the given symbol and return the readable name.
   ///
-  /// \param MangledName The mangled symbol string, which start with the
-  /// mangling prefix _T.
+  /// \param MangledName The mangled symbol string, which start a mangling
+  /// prefix: _T, _T0, $S, _$S.
   ///
   /// \returns The demangled string.
   std::string demangleSymbolAsString(llvm::StringRef MangledName,
@@ -284,7 +341,7 @@ public:
   /// Demangle the given type and return the readable name.
   ///
   /// \param MangledName The mangled type string, which does _not_ start with
-  /// the mangling prefix _T.
+  /// a mangling prefix.
   ///
   /// \returns The demangled string.
   std::string demangleTypeAsString(llvm::StringRef MangledName,
@@ -490,7 +547,37 @@ bool isSpecialized(Node *node);
 NodePointer getUnspecialized(Node *node, NodeFactory &Factory);
 std::string archetypeName(Node::IndexType index, Node::IndexType depth);
 
+/// Form a StringRef around the mangled name starting at base, if the name may
+/// contain symbolic references.
+llvm::StringRef makeSymbolicMangledNameStringRef(const char *base);
+
 } // end namespace Demangle
 } // end namespace swift
+
+// NB: This function is not used directly in the Swift codebase, but is
+// exported for Xcode support and is used by the sanitizers. Please coordinate
+// before changing.
+//
+/// Demangles a Swift symbol name.
+///
+/// \param mangledName is the symbol name that needs to be demangled.
+/// \param mangledNameLength is the length of the string that should be
+/// demangled.
+/// \param outputBuffer is the user provided buffer where the demangled name
+/// will be placed. If nullptr, a new buffer will be malloced. In that case,
+/// the user of this API is responsible for freeing the returned buffer.
+/// \param outputBufferSize is the size of the output buffer. If the demangled
+/// name does not fit into the outputBuffer, the output will be truncated and
+/// the size will be updated, indicating how large the buffer should be.
+/// \param flags can be used to select the demangling style. TODO: We should
+//// define what these will be.
+/// \returns the demangled name. Returns nullptr if the input String is not a
+/// Swift mangled name.
+SWIFT_RUNTIME_EXPORT
+char *swift_demangle(const char *mangledName,
+                     size_t mangledNameLength,
+                     char *outputBuffer,
+                     size_t *outputBufferSize,
+                     uint32_t flags);
 
 #endif // SWIFT_DEMANGLING_DEMANGLE_H

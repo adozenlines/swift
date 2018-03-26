@@ -20,13 +20,14 @@ extension LazySequenceProtocol {
   /// `s.map(transform).joined()`.
   ///
   /// - Complexity: O(1)
+  @_inlineable // FIXME(sil-serialize-all)
   public func flatMap<SegmentOfResult>(
-    _ transform: @escaping (Elements.Iterator.Element) -> SegmentOfResult
+    _ transform: @escaping (Elements.Element) -> SegmentOfResult
   ) -> LazySequence<
     FlattenSequence<LazyMapSequence<Elements, SegmentOfResult>>> {
     return self.map(transform).joined()
   }
-  
+
   /// Returns the non-`nil` results of mapping the given transformation over
   /// this sequence.
   ///
@@ -37,14 +38,38 @@ extension LazySequenceProtocol {
   ///   as its argument and returns an optional value.
   ///
   /// - Complexity: O(1)
-  public func flatMap<ElementOfResult>(
-    _ transform: @escaping (Elements.Iterator.Element) -> ElementOfResult?
+  @_inlineable // FIXME(sil-serialize-all)
+  public func compactMap<ElementOfResult>(
+    _ transform: @escaping (Elements.Element) -> ElementOfResult?
   ) -> LazyMapSequence<
     LazyFilterSequence<
       LazyMapSequence<Elements, ElementOfResult?>>,
     ElementOfResult
   > {
     return self.map(transform).filter { $0 != nil }.map { $0! }
+  }
+
+  /// Returns the non-`nil` results of mapping the given transformation over
+  /// this sequence.
+  ///
+  /// Use this method to receive a sequence of nonoptional values when your
+  /// transformation produces an optional value.
+  ///
+  /// - Parameter transform: A closure that accepts an element of this sequence
+  ///   as its argument and returns an optional value.
+  ///
+  /// - Complexity: O(1)
+  @inline(__always)
+  @available(swift, deprecated: 4.1, renamed: "compactMap(_:)",
+    message: "Please use compactMap(_:) for the case where closure returns an optional value")
+  public func flatMap<ElementOfResult>(
+    _ transform: @escaping (Elements.Element) -> ElementOfResult?
+  ) -> LazyMapSequence<
+    LazyFilterSequence<
+      LazyMapSequence<Elements, ElementOfResult?>>,
+    ElementOfResult
+  > {
+    return self.compactMap(transform)
   }
 }
 
@@ -58,15 +83,16 @@ extension LazyCollectionProtocol {
   /// `c.map(transform).joined()`.
   ///
   /// - Complexity: O(1)
+  @_inlineable // FIXME(sil-serialize-all)
   public func flatMap<SegmentOfResult>(
-    _ transform: @escaping (Elements.Iterator.Element) -> SegmentOfResult
+    _ transform: @escaping (Elements.Element) -> SegmentOfResult
   ) -> LazyCollection<
     FlattenCollection<
       LazyMapCollection<Elements, SegmentOfResult>>
   > {
     return self.map(transform).joined()
   }
-  
+
   /// Returns the non-`nil` results of mapping the given transformation over
   /// this collection.
   ///
@@ -77,8 +103,9 @@ extension LazyCollectionProtocol {
   ///   collection as its argument and returns an optional value.
   ///
   /// - Complexity: O(1)
-  public func flatMap<ElementOfResult>(
-    _ transform: @escaping (Elements.Iterator.Element) -> ElementOfResult?
+  @_inlineable // FIXME(sil-serialize-all)
+  public func compactMap<ElementOfResult>(
+    _ transform: @escaping (Elements.Element) -> ElementOfResult?
   ) -> LazyMapCollection<
     LazyFilterCollection<
       LazyMapCollection<Elements, ElementOfResult?>>,
@@ -86,30 +113,7 @@ extension LazyCollectionProtocol {
   > {
     return self.map(transform).filter { $0 != nil }.map { $0! }
   }
-}
 
-extension LazyCollectionProtocol
-  where
-  Self : BidirectionalCollection,
-  Elements : BidirectionalCollection
-{
-  /// Returns the concatenated results of mapping the given transformation over
-  /// this collection.
-  ///
-  /// Use this method to receive a single-level collection when your
-  /// transformation produces a collection for each element.
-  /// Calling `flatMap(_:)` on a collection `c` is equivalent to calling
-  /// `c.map(transform).joined()`.
-  ///
-  /// - Complexity: O(1)
-  public func flatMap<SegmentOfResult>(
-    _ transform: @escaping (Elements.Iterator.Element) -> SegmentOfResult
-  ) -> LazyCollection<
-    FlattenBidirectionalCollection<
-      LazyMapBidirectionalCollection<Elements, SegmentOfResult>>> {
-    return self.map(transform).joined()
-  }
-  
   /// Returns the non-`nil` results of mapping the given transformation over
   /// this collection.
   ///
@@ -120,11 +124,14 @@ extension LazyCollectionProtocol
   ///   collection as its argument and returns an optional value.
   ///
   /// - Complexity: O(1)
+  @available(swift, deprecated: 4.1, renamed: "compactMap(_:)",
+    message: "Please use compactMap(_:) for the case where closure returns an optional value")
+  @_inlineable // FIXME(sil-serialize-all)
   public func flatMap<ElementOfResult>(
-    _ transform: @escaping (Elements.Iterator.Element) -> ElementOfResult?
-  ) -> LazyMapBidirectionalCollection<
-    LazyFilterBidirectionalCollection<
-      LazyMapBidirectionalCollection<Elements, ElementOfResult?>>,
+    _ transform: @escaping (Elements.Element) -> ElementOfResult?
+  ) -> LazyMapCollection<
+    LazyFilterCollection<
+      LazyMapCollection<Elements, ElementOfResult?>>,
     ElementOfResult
   > {
     return self.map(transform).filter { $0 != nil }.map { $0! }

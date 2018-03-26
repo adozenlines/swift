@@ -37,9 +37,9 @@ decomposeInheritedClauseDecl(
     inheritanceClause = typeDecl->getInherited();
     if (auto nominal = dyn_cast<NominalTypeDecl>(typeDecl)) {
       dc = nominal;
-      options |= (TR_GenericSignature |
-                  TR_InheritanceClause |
-                  TR_AllowUnavailableProtocol);
+      options |= TypeResolutionFlags::GenericSignature;
+      options |= TypeResolutionFlags::InheritanceClause;
+      options |= TypeResolutionFlags::AllowUnavailableProtocol;
     } else {
       dc = typeDecl->getDeclContext();
 
@@ -48,30 +48,26 @@ decomposeInheritedClauseDecl(
         // signature of the enclosing entity.
         if (auto nominal = dyn_cast<NominalTypeDecl>(dc)) {
           dc = nominal;
-          options |= TR_GenericSignature;
+          options |= TypeResolutionFlags::GenericSignature;
         } else if (auto ext = dyn_cast<ExtensionDecl>(dc)) {
           dc = ext;
-          options |= TR_GenericSignature;
+          options |= TypeResolutionFlags::GenericSignature;
         } else if (auto func = dyn_cast<AbstractFunctionDecl>(dc)) {
           dc = func;
-          options |= TR_GenericSignature;
+          options |= TypeResolutionFlags::GenericSignature;
         } else if (!dc->isModuleScopeContext()) {
           // Skip the generic parameter's context entirely.
           dc = dc->getParent();
         }
       }
     }
-
-    if (!isa<EnumDecl>(typeDecl)) {
-      options |= TR_NonEnumInheritanceClauseOuterLayer;
-    }
   } else {
     auto ext = decl.get<ExtensionDecl *>();
     inheritanceClause = ext->getInherited();
     dc = ext;
-    options |= (TR_GenericSignature |
-                TR_InheritanceClause |
-                TR_AllowUnavailableProtocol);
+    options |= TypeResolutionFlags::GenericSignature;
+    options |= TypeResolutionFlags::InheritanceClause;
+    options |= TypeResolutionFlags::AllowUnavailableProtocol;
   }
 
   return std::make_tuple(options, dc, inheritanceClause);
@@ -112,15 +108,23 @@ void IterativeTypeChecker::processResolveInheritedClauseEntry(
 
   // Validate the type of this inherited clause entry.
   // FIXME: Recursion into existing type checker.
-  GenericTypeToArchetypeResolver resolver(dc);
-  if (TC.validateType(*inherited, dc, options, &resolver,
+  ProtocolRequirementTypeResolver protoResolver;
+  GenericTypeToArchetypeResolver archetypeResolver(dc);
+  GenericTypeResolver *resolver;
+  if (isa<ProtocolDecl>(dc)) {
+    resolver = &protoResolver;
+  } else {
+    resolver = &archetypeResolver;
+  }
+
+  if (TC.validateType(*inherited, dc, options, resolver,
                       &unsatisfiedDependency)) {
     inherited->setInvalidType(getASTContext());
   }
 
   auto type = inherited->getType();
-  if (!type.isNull())
-    inherited->setType(dc->mapTypeOutOfContext(type));
+  if (!type.isNull() && !isa<ProtocolDecl>(dc))
+    inherited->setType(type->mapTypeOutOfContext());
 }
 
 bool IterativeTypeChecker::breakCycleForResolveInheritedClauseEntry(
@@ -258,8 +262,6 @@ void IterativeTypeChecker::processInheritedProtocols(
     // FIXME: We'd prefer to keep what the user wrote here.
     if (inherited.getType()->isExistentialType()) {
       auto layout = inherited.getType()->getExistentialLayout();
-      assert(!layout.superclass && "Need to redo inheritance clause "
-             "typechecking");
       for (auto inheritedProtocolTy: layout.getProtocols()) {
         auto *inheritedProtocol = inheritedProtocolTy->getDecl();
 
@@ -338,11 +340,12 @@ void IterativeTypeChecker::processResolveTypeDecl(
   if (auto typeAliasDecl = dyn_cast<TypeAliasDecl>(typeDecl)) {
     if (typeAliasDecl->getDeclContext()->isModuleScopeContext() &&
         typeAliasDecl->getGenericParams() == nullptr) {
-      typeAliasDecl->setValidationStarted();
-
-      TypeResolutionOptions options = TR_TypeAliasUnderlyingType;
-      if (typeAliasDecl->getFormalAccess() <= Accessibility::FilePrivate)
-        options |= TR_KnownNonCascadingDependency;
+      TypeResolutionOptions options =
+                                   TypeResolutionFlags::TypeAliasUnderlyingType;
+      if (!typeAliasDecl->getDeclContext()->isCascadingContextForLookup(
+            /*functionsAreNonCascading*/true)) {
+        options |= TypeResolutionFlags::KnownNonCascadingDependency;
+      }
 
       // Note: recursion into old type checker is okay when passing in an
       // unsatisfied-dependency callback.

@@ -1,5 +1,4 @@
-// RUN: rm -rf %t
-// RUN: mkdir -p %t
+// RUN: %empty-directory(%t)
 
 // RUN: %target-swift-frontend -emit-module -primary-file %s %S/Inputs/sil-merge-partial-modules-other.swift -module-name test -enable-resilience -o %t/partial.a.swiftmodule
 // RUN: %target-swift-frontend -emit-module %s -primary-file %S/Inputs/sil-merge-partial-modules-other.swift -module-name test -enable-resilience -o %t/partial.b.swiftmodule
@@ -43,31 +42,31 @@ public class CircleManager : ShapeManager {
 
 // FIXME: Why is the definition order totally random?
 
-// CHECK-LABEL: sil shared [serialized] @_T04test18inlineableFunctionyyFyycfU_ : $@convention(thin) () -> () {
-// CHECK: function_ref @_T04test17versionedFunctionyyF
+// CHECK-LABEL: sil [canonical] @$S4test17versionedFunctionyyF : $@convention(thin) () -> ()
+
+// CHECK-LABEL: sil [canonical] @$S4test9RectangleV4areaSfvg : $@convention(method) (Rectangle) -> Float
+
+// CHECK-LABEL: sil shared [serialized] [canonical] @$S4test18inlineableFunctionyyFyycfU_ : $@convention(thin) () -> () {
+// CHECK: function_ref @$S4test17versionedFunctionyyF
 // CHECK: }
 
-// CHECK-LABEL: sil @_T04test17versionedFunctionyyF : $@convention(thin) () -> ()
-
-// CHECK-LABEL: sil shared [transparent] [serialized] [thunk] @_T04test9RectangleVAA5ShapeA2aDP4drawyyFTW : $@convention(witness_method) (@in_guaranteed Rectangle) -> () {
-// CHECK: function_ref @_T04test14publicFunctionyyF
+// CHECK-LABEL: sil shared [transparent] [serialized] [thunk] [canonical] @$S4test9RectangleVAA5ShapeA2aDP4drawyyFTW : $@convention(witness_method: Shape) (@in_guaranteed Rectangle) -> () {
+// CHECK: function_ref @$S4test14publicFunctionyyF
 // CHECK: }
 
-// CHECK-LABEL: sil [serialized] @_T04test18inlineableFunctionyyF : $@convention(thin) () -> () {
-// CHECK: function_ref @_T04test18inlineableFunctionyyFyycfU_
+// CHECK-LABEL: sil [serialized] [canonical] @$S4test18inlineableFunctionyyF : $@convention(thin) () -> () {
+// CHECK: function_ref @$S4test18inlineableFunctionyyFyycfU_
 // CHECK: }
 
-// CHECK-LABEL: sil @_T04test14publicFunctionyyF : $@convention(thin) () -> ()
+// CHECK-LABEL: sil [canonical] @$S4test14publicFunctionyyF : $@convention(thin) () -> ()
 
-// CHECK-LABEL: sil shared [transparent] [serialized] [thunk] @_T04test9RectangleVAA5ShapeA2aDP4areaSffgTW : $@convention(witness_method) (@in_guaranteed Rectangle) -> Float {
-// CHECK: function_ref @_T04test9RectangleV4areaSffg
+// CHECK-LABEL: sil shared [transparent] [serialized] [thunk] [canonical] @$S4test9RectangleVAA5ShapeA2aDP4areaSfvgTW : $@convention(witness_method: Shape) (@in_guaranteed Rectangle) -> Float {
+// CHECK: function_ref @$S4test9RectangleV4areaSfvg
 // CHECK: }
-
-// CHECK-LABEL: sil @_T04test9RectangleV4areaSffg : $@convention(method) (Rectangle) -> Float
 
 // CHECK-LABEL: sil_witness_table [serialized] Rectangle: Shape module test {
-// CHECK-LABEL:   method #Shape.draw!1: <Self where Self : Shape> (Self) -> () -> () : @_T04test9RectangleVAA5ShapeA2aDP4drawyyFTW
-// CHECK-LABEL:   method #Shape.area!getter.1: <Self where Self : Shape> (Self) -> () -> Float : @_T04test9RectangleVAA5ShapeA2aDP4areaSffgTW
+// CHECK-LABEL:   method #Shape.draw!1: <Self where Self : Shape> (Self) -> () -> () : @$S4test9RectangleVAA5ShapeA2aDP4drawyyFTW
+// CHECK-LABEL:   method #Shape.area!getter.1: <Self where Self : Shape> (Self) -> () -> Float : @$S4test9RectangleVAA5ShapeA2aDP4areaSfvgTW
 // CHECK-LABEL: }
 
 // NEGATIVE-NOT: sil {{.*}}internalFunction

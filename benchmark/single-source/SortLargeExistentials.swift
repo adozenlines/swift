@@ -14,12 +14,17 @@
 
 import TestsUtils
 
+public let SortLargeExistentials = BenchmarkInfo(
+  name: "SortLargeExistentials",
+  runFunction: run_SortLargeExistentials,
+  tags: [.validation, .api, .algorithm])
+
 protocol LetterKind {
   var value: String { get }
   func lessthan(_ rhs: LetterKind) -> Bool
 }
 
-// A struct which exeeds the size of the existential inline buffer.
+// A struct which exceeds the size of the existential inline buffer.
 struct Letter : LetterKind {
   let value: String
 

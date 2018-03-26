@@ -19,18 +19,26 @@
 
 #include <cstdint>
 
+#include "swift/Runtime/Config.h"
+
 namespace swift {
 
 enum class ExclusivityFlags : uintptr_t;
-struct ValueBuffer;
+template <typename Runtime> struct TargetValueBuffer;
+struct InProcess;
+using ValueBuffer = TargetValueBuffer<InProcess>;
 
 /// Begin dynamically tracking an access.
 ///
 /// The buffer is opaque scratch space that the runtime may use for
 /// the duration of the access.
+///
+/// The PC argument is an instruction pointer to associate with the start
+/// of the access.  If it is null, the return address of the call to
+/// swift_beginAccess will be used.
 SWIFT_RUNTIME_EXPORT
 void swift_beginAccess(void *pointer, ValueBuffer *buffer,
-                       ExclusivityFlags flags);
+                       ExclusivityFlags flags, void *pc);
 
 /// Stop dynamically tracking an access.
 SWIFT_RUNTIME_EXPORT

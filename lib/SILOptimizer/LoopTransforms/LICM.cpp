@@ -72,6 +72,7 @@ static bool mayWriteTo(AliasAnalysis *AA, SideEffectAnalysis *SEA,
 
   for (unsigned Idx = 0, End = AI->getNumArguments(); Idx < End; ++Idx) {
     auto &ArgEffect = E.getParameterEffects()[Idx];
+    assert(!ArgEffect.mayRelease() && "apply should only read from memory");
     if (!ArgEffect.mayRead())
       continue;
 
@@ -115,7 +116,7 @@ static bool hasLoopInvariantOperands(SILInstruction *I, SILLoop *L) {
     ValueBase *Def = Op.get();
 
     // Operand is defined outside the loop.
-    if (auto *Inst = dyn_cast<SILInstruction>(Def))
+    if (auto *Inst = Def->getDefiningInstruction())
       return !L->contains(Inst->getParent());
     if (auto *Arg = dyn_cast<SILArgument>(Def))
       return !L->contains(Arg->getParent());

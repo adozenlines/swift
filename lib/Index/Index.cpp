@@ -19,11 +19,11 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
-#include "swift/AST/SourceEntityWalker.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/USRGeneration.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/StringExtras.h"
+#include "swift/IDE/SourceEntityWalker.h"
 #include "swift/Markup/Markup.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "llvm/ADT/APInt.h"
@@ -50,7 +50,6 @@ printArtificialName(const swift::AbstractStorageDecl *ASD, AccessorKind AK, llvm
     OS << "willSet:" << ASD->getFullName() ;
     return false;
 
-  case AccessorKind::NotAccessor:
   case AccessorKind::IsMaterializeForSet:
   case AccessorKind::IsAddressor:
   case AccessorKind::IsMutableAddressor:
@@ -62,10 +61,10 @@ printArtificialName(const swift::AbstractStorageDecl *ASD, AccessorKind AK, llvm
 
 static bool printDisplayName(const swift::ValueDecl *D, llvm::raw_ostream &OS) {
   if (!D->hasName() && !isa<ParamDecl>(D)) {
-    auto *FD = dyn_cast<FuncDecl>(D);
-    if (!FD || FD->getAccessorKind() == AccessorKind::NotAccessor)
+    auto *FD = dyn_cast<AccessorDecl>(D);
+    if (!FD)
       return true;
-    return printArtificialName(FD->getAccessorStorageDecl(), FD->getAccessorKind(), OS);
+    return printArtificialName(FD->getStorage(), FD->getAccessorKind(), OS);
   }
 
   OS << D->getFullName();
@@ -179,7 +178,6 @@ class IndexSwiftASTWalker : public SourceEntityWalker {
   }
 
   bool getPseudoAccessorNameAndUSR(AbstractStorageDecl *D, AccessorKind AK, StringRef &Name, StringRef &USR) {
-    assert(AK != AccessorKind::NotAccessor);
     assert(static_cast<int>(AK) < 0x111 && "AccessorKind too big for pair");
     DeclAccessorPair key(D, static_cast<int>(AK));
     auto &result = accessorNameAndUSRCache[key];
@@ -256,32 +254,14 @@ private:
     // Do not handle unavailable decls.
     if (AvailableAttr::isUnavailable(D))
       return false;
-    if (auto *FD = dyn_cast<FuncDecl>(D)) {
-      if (FD->isAccessor() && getParentDecl() != FD->getAccessorStorageDecl())
+    if (auto *AD = dyn_cast<AccessorDecl>(D)) {
+      auto *Parent = getParentDecl();
+      if (Parent && Parent != AD->getStorage())
         return false; // already handled as part of the var decl.
     }
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
       if (!report(VD))
         return false;
-      if (auto *SD = dyn_cast<SubscriptDecl>(VD)) {
-        // Avoid indexing the indices, only walk the getter/setter.
-        if (SD->getGetter())
-          if (SourceEntityWalker::walk(cast<Decl>(SD->getGetter())))
-            return false;
-        if (SD->getSetter())
-          if (SourceEntityWalker::walk(cast<Decl>(SD->getSetter())))
-            return false;
-        if (SD->hasAddressors()) {
-          if (auto FD = SD->getAddressor())
-            SourceEntityWalker::walk(cast<Decl>(FD));
-          if (Cancelled)
-            return false;
-          if (auto FD = SD->getMutableAddressor())
-            SourceEntityWalker::walk(cast<Decl>(FD));
-        }
-        walkToDeclPost(D);
-        return false; // already walked what we needed.
-      }
     }
     if (auto *ED = dyn_cast<ExtensionDecl>(D))
       return reportExtension(ED);
@@ -370,9 +350,9 @@ private:
 
     IndexSymbol Info;
     if (CtorTyRef)
-      if (!reportRef(CtorTyRef, Loc, Info))
+      if (!reportRef(CtorTyRef, Loc, Info, Data.AccKind))
         return false;
-    if (!reportRef(D, Loc, Info))
+    if (!reportRef(D, Loc, Info, Data.AccKind))
       return false;
 
     return true;
@@ -415,7 +395,8 @@ private:
 
   bool report(ValueDecl *D);
   bool reportExtension(ExtensionDecl *D);
-  bool reportRef(ValueDecl *D, SourceLoc Loc, IndexSymbol &Info);
+  bool reportRef(ValueDecl *D, SourceLoc Loc, IndexSymbol &Info,
+                 Optional<AccessKind> AccKind);
 
   bool startEntity(Decl *D, IndexSymbol &Info);
   bool startEntityDecl(ValueDecl *D);
@@ -453,7 +434,7 @@ private:
   bool initFuncDeclIndexSymbol(FuncDecl *D, IndexSymbol &Info);
   bool initFuncRefIndexSymbol(ValueDecl *D, SourceLoc Loc, IndexSymbol &Info);
   bool initVarRefIndexSymbols(Expr *CurrentE, ValueDecl *D, SourceLoc Loc,
-                              IndexSymbol &Info);
+                              IndexSymbol &Info, Optional<AccessKind> AccKind);
 
   bool indexComment(const Decl *D);
 
@@ -708,7 +689,7 @@ bool IndexSwiftASTWalker::reportRelatedRef(ValueDecl *D, SourceLoc Loc, bool isI
   // don't report this ref again when visitDeclReference reports it
   repressRefAtLoc(Loc);
 
-  if (!reportRef(D, Loc, Info)) {
+  if (!reportRef(D, Loc, Info, None)) {
     Cancelled = true;
     return false;
   }
@@ -726,7 +707,7 @@ bool IndexSwiftASTWalker::reportInheritedTypeRefs(ArrayRef<TypeLoc> Inherited, D
 
 bool IndexSwiftASTWalker::reportRelatedTypeRef(const TypeLoc &Ty, SymbolRoleSet Relations, Decl *Related) {
 
-  if (IdentTypeRepr *T = dyn_cast_or_null<IdentTypeRepr>(Ty.getTypeRepr())) {
+  if (auto *T = dyn_cast_or_null<IdentTypeRepr>(Ty.getTypeRepr())) {
     auto Comps = T->getComponentRange();
     SourceLoc IdLoc = Comps.back()->getIdLoc();
     NominalTypeDecl *NTD = nullptr;
@@ -734,7 +715,7 @@ bool IndexSwiftASTWalker::reportRelatedTypeRef(const TypeLoc &Ty, SymbolRoleSet 
     if (auto *VD = Comps.back()->getBoundDecl()) {
       if (auto *TAD = dyn_cast<TypeAliasDecl>(VD)) {
         IndexSymbol Info;
-        if (!reportRef(TAD, IdLoc, Info))
+        if (!reportRef(TAD, IdLoc, Info, None))
           return false;
         if (auto Ty = TAD->getUnderlyingTypeLoc().getType()) {
           NTD = Ty->getAnyNominal();
@@ -845,7 +826,7 @@ NominalTypeDecl *
 IndexSwiftASTWalker::getTypeLocAsNominalTypeDecl(const TypeLoc &Ty) {
   if (Type T = Ty.getType())
     return T->getAnyNominal();
-  if (IdentTypeRepr *T = dyn_cast_or_null<IdentTypeRepr>(Ty.getTypeRepr())) {
+  if (auto *T = dyn_cast_or_null<IdentTypeRepr>(Ty.getTypeRepr())) {
     auto Comp = T->getComponentRange().back();
     if (auto NTD = dyn_cast_or_null<NominalTypeDecl>(Comp->getBoundDecl()))
       return NTD;
@@ -885,12 +866,13 @@ bool IndexSwiftASTWalker::reportExtension(ExtensionDecl *D) {
 bool IndexSwiftASTWalker::report(ValueDecl *D) {
   if (startEntityDecl(D)) {
     // Pass accessors.
-    if (auto VarD = dyn_cast<VarDecl>(D)) {
+    if (auto StoreD = dyn_cast<AbstractStorageDecl>(D)) {
       auto isNullOrImplicit = [](const Decl *D) -> bool {
         return !D || D->isImplicit();
       };
-      if (isNullOrImplicit(VarD->getGetter()) &&
-          isNullOrImplicit(VarD->getSetter())) {
+      if (isa<VarDecl>(D) && isNullOrImplicit(StoreD->getGetter()) &&
+          isNullOrImplicit(StoreD->getSetter())) {
+        auto VarD = cast<VarDecl>(D);
         // No actual getter or setter, pass 'pseudo' accessors.
         // We create accessor entities so we can implement the functionality
         // of libclang, which reports implicit method property accessor
@@ -903,31 +885,31 @@ bool IndexSwiftASTWalker::report(ValueDecl *D) {
         if (!reportPseudoSetterDecl(VarD))
           return false;
       } else {
-        if (auto FD = VarD->getGetter())
+        if (auto FD = StoreD->getGetter())
           SourceEntityWalker::walk(cast<Decl>(FD));
         if (Cancelled)
           return false;
-        if (auto FD = VarD->getSetter())
-          SourceEntityWalker::walk(cast<Decl>(FD));
-        if (Cancelled)
-          return false;
-      }
-      if (VarD->hasObservers()) {
-        if (auto FD = VarD->getWillSetFunc())
-          SourceEntityWalker::walk(cast<Decl>(FD));
-        if (Cancelled)
-          return false;
-        if (auto FD = VarD->getDidSetFunc())
+        if (auto FD = StoreD->getSetter())
           SourceEntityWalker::walk(cast<Decl>(FD));
         if (Cancelled)
           return false;
       }
-      if (VarD->hasAddressors()) {
-        if (auto FD = VarD->getAddressor())
+      if (StoreD->hasObservers()) {
+        if (auto FD = StoreD->getWillSetFunc())
           SourceEntityWalker::walk(cast<Decl>(FD));
         if (Cancelled)
           return false;
-        if (auto FD = VarD->getMutableAddressor())
+        if (auto FD = StoreD->getDidSetFunc())
+          SourceEntityWalker::walk(cast<Decl>(FD));
+        if (Cancelled)
+          return false;
+      }
+      if (StoreD->hasAddressors()) {
+        if (auto FD = StoreD->getAddressor())
+          SourceEntityWalker::walk(cast<Decl>(FD));
+        if (Cancelled)
+          return false;
+        if (auto FD = StoreD->getMutableAddressor())
           SourceEntityWalker::walk(cast<Decl>(FD));
       }
     } else if (auto NTD = dyn_cast<NominalTypeDecl>(D)) {
@@ -951,7 +933,8 @@ static bool hasUsefulRoleInSystemModule(SymbolRoleSet roles) {
 }
 
 bool IndexSwiftASTWalker::reportRef(ValueDecl *D, SourceLoc Loc,
-                                    IndexSymbol &Info) {
+                                    IndexSymbol &Info,
+                                    Optional<AccessKind> AccKind) {
   if (!shouldIndex(D, /*IsRef=*/true))
     return true; // keep walking
 
@@ -959,7 +942,7 @@ bool IndexSwiftASTWalker::reportRef(ValueDecl *D, SourceLoc Loc,
     if (initFuncRefIndexSymbol(D, Loc, Info))
       return true;
   } else if (isa<AbstractStorageDecl>(D)) {
-    if (initVarRefIndexSymbols(getCurrentExpr(), D, Loc, Info))
+    if (initVarRefIndexSymbols(getCurrentExpr(), D, Loc, Info, AccKind))
       return true;
   } else {
     if (initIndexSymbol(D, Loc, /*IsRef=*/true, Info))
@@ -1042,10 +1025,7 @@ bool IndexSwiftASTWalker::initIndexSymbol(ExtensionDecl *ExtD, ValueDecl *Extend
 }
 
 static NominalTypeDecl *getNominalParent(ValueDecl *D) {
-  Type Ty = D->getDeclContext()->getDeclaredTypeOfContext();
-  if (!Ty)
-    return nullptr;
-  return Ty->getAnyNominal();
+  return D->getDeclContext()->getAsNominalTypeOrNominalTypeExtensionContext();
 }
 
 bool IndexSwiftASTWalker::initFuncDeclIndexSymbol(FuncDecl *D,
@@ -1156,7 +1136,6 @@ bool IndexSwiftASTWalker::initFuncRefIndexSymbol(ValueDecl *D, SourceLoc Loc,
       ReceiverTy = MetaT->getInstanceType();
 
     if (auto TyD = ReceiverTy->getAnyNominal()) {
-      StringRef unused;
       if (addRelation(Info, (SymbolRoleSet) SymbolRole::RelationReceivedBy, TyD))
         return true;
       if (isDynamicCall(BaseE, D))
@@ -1167,7 +1146,9 @@ bool IndexSwiftASTWalker::initFuncRefIndexSymbol(ValueDecl *D, SourceLoc Loc,
   return false;
 }
 
-bool IndexSwiftASTWalker::initVarRefIndexSymbols(Expr *CurrentE, ValueDecl *D, SourceLoc Loc, IndexSymbol &Info) {
+bool IndexSwiftASTWalker::initVarRefIndexSymbols(Expr *CurrentE, ValueDecl *D,
+                                                 SourceLoc Loc, IndexSymbol &Info,
+                                                 Optional<AccessKind> AccKind) {
 
   if (initIndexSymbol(D, Loc, /*IsRef=*/true, Info))
     return true;
@@ -1175,7 +1156,7 @@ bool IndexSwiftASTWalker::initVarRefIndexSymbols(Expr *CurrentE, ValueDecl *D, S
   if (!CurrentE)
     return false;
 
-  AccessKind Kind = CurrentE->hasLValueAccessKind() ? CurrentE->getLValueAccessKind() : AccessKind::Read;
+  AccessKind Kind = AccKind.hasValue() ? *AccKind : AccessKind::Read;
   switch (Kind) {
   case swift::AccessKind::Read:
     Info.roles |= (unsigned)SymbolRole::Read;
@@ -1228,7 +1209,7 @@ bool IndexSwiftASTWalker::indexComment(const Decl *D) {
     IndexSymbol Info;
     Info.decl = nullptr;
     Info.symInfo = SymbolInfo{ SymbolKind::CommentTag, SymbolSubKind::None,
-      SymbolPropertySet(), SymbolLanguage::Swift };
+      SymbolLanguage::Swift, SymbolPropertySet() };
     Info.roles |= (unsigned)SymbolRole::Definition;
     Info.name = StringRef();
     SmallString<128> storage;

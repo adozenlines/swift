@@ -126,6 +126,8 @@ public:
       return S;
     case StmtKind::Brace:
       return transformBraceStmt(cast<BraceStmt>(S));
+    case StmtKind::Defer:
+      return transformDeferStmt(cast<DeferStmt>(S));
     case StmtKind::If:
       return transformIfStmt(cast<IfStmt>(S));
     case StmtKind::Guard:
@@ -137,10 +139,6 @@ public:
     case StmtKind::RepeatWhile: {
       TargetKindSetter TKS(BracePairs, BracePair::TargetKinds::Break);
       return transformRepeatWhileStmt(cast<RepeatWhileStmt>(S));
-    }
-    case StmtKind::For: {
-      TargetKindSetter TKS(BracePairs, BracePair::TargetKinds::Break);
-      return transformForStmt(cast<ForStmt>(S));
     }
     case StmtKind::ForEach: {
       TargetKindSetter TKS(BracePairs, BracePair::TargetKinds::Break);
@@ -155,6 +153,20 @@ public:
     case StmtKind::DoCatch:
       return transformDoCatchStmt(cast<DoCatchStmt>(S));
     }
+  }
+
+  DeferStmt *transformDeferStmt(DeferStmt *DS) {
+    if (auto *FD = DS->getTempDecl()) {
+      // Temporarily unmark the DeferStmt's FuncDecl as implicit so it is
+      // transformed (as typically implicit Decls are skipped by the
+      // transformer).
+      auto Implicit = FD->isImplicit();
+      FD->setImplicit(false);
+      auto *D = transformDecl(FD);
+      D->setImplicit(Implicit);
+      assert(D == FD);
+    }
+    return DS;
   }
 
   // transform*() return their input if it's unmodified,
@@ -205,17 +217,6 @@ public:
     return RWS;
   }
 
-  ForStmt *transformForStmt(ForStmt *FS) {
-    if (Stmt *B = FS->getBody()) {
-      Stmt *NB = transformStmt(B);
-      if (NB != B) {
-        FS->setBody(NB);
-      }
-    }
-
-    return FS;
-  }
-
   ForEachStmt *transformForEachStmt(ForEachStmt *FES) {
     if (BraceStmt *B = FES->getBody()) {
       BraceStmt *NB = transformBraceStmt(B);
@@ -243,7 +244,7 @@ public:
   }
 
   DoStmt *transformDoStmt(DoStmt *DS) {
-    if (BraceStmt *B = dyn_cast_or_null<BraceStmt>(DS->getBody())) {
+    if (auto *B = dyn_cast_or_null<BraceStmt>(DS->getBody())) {
       BraceStmt *NB = transformBraceStmt(B);
       if (NB != B) {
         DS->setBody(NB);
@@ -253,14 +254,14 @@ public:
   }
 
   DoCatchStmt *transformDoCatchStmt(DoCatchStmt *DCS) {
-    if (BraceStmt *B = dyn_cast_or_null<BraceStmt>(DCS->getBody())) {
+    if (auto *B = dyn_cast_or_null<BraceStmt>(DCS->getBody())) {
       BraceStmt *NB = transformBraceStmt(B);
       if (NB != B) {
         DCS->setBody(NB);
       }
     }
     for (CatchStmt *C : DCS->getCatches()) {
-      if (BraceStmt *CB = dyn_cast_or_null<BraceStmt>(C->getBody())) {
+      if (auto *CB = dyn_cast_or_null<BraceStmt>(C->getBody())) {
         BraceStmt *NCB = transformBraceStmt(CB);
         if (NCB != CB) {
           C->setBody(NCB);
@@ -279,6 +280,7 @@ public:
         BraceStmt *NB = transformBraceStmt(B);
         if (NB != B) {
           FD->setBody(NB);
+          TypeChecker(Context).checkFunctionErrorHandling(FD);
         }
       }
     } else if (auto *NTD = dyn_cast<NominalTypeDecl>(D)) {
@@ -331,7 +333,7 @@ public:
     ValueDecl *VD = nullptr;
     std::tie(RE, VD) = digForVariable(E);
     if (VD) {
-      return VD->getName().str();
+      return VD->getBaseName().getIdentifier().str();
     } else {
       return std::string("");
     }
@@ -639,7 +641,8 @@ public:
           new (Context) MemberRefExpr(B, SourceLoc(), M, DeclNameLoc(),
                                       true, // implicit
                                       AccessSemantics::Ordinary),
-          MRE->getSourceRange(), M.getDecl()->getName().str().str().c_str());
+          MRE->getSourceRange(),
+          M.getDecl()->getBaseName().getIdentifier().str().str().c_str());
     } else {
       return nullptr;
     }
@@ -668,7 +671,7 @@ public:
           useJustFirst = true;
         } else {
           for (Expr *Arg : TE->getElements()) {
-            if (Arg->getType()->is<InOutType>()) {
+            if (Arg->isSemanticallyInOutExpr()) {
               useJustFirst = true;
               break;
             }
@@ -743,11 +746,11 @@ public:
     }
 
     VarDecl *VD =
-        new (Context) VarDecl(/*IsStatic*/false, /*IsLet*/true,
+        new (Context) VarDecl(/*IsStatic*/false, VarDecl::Specifier::Let,
                               /*IsCaptureList*/false, SourceLoc(),
                               Context.getIdentifier(NameBuf),
                               MaybeLoadInitExpr->getType(), TypeCheckDC);
-    VD->setInterfaceType(TypeCheckDC->mapTypeOutOfContext(VD->getType()));
+    VD->setInterfaceType(VD->getType()->mapTypeOutOfContext());
     VD->setImplicit();
 
     NamedPattern *NP = new (Context) NamedPattern(VD, /*implicit*/ true);

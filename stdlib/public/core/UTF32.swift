@@ -9,36 +9,51 @@
 // See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
-extension _Unicode {
+extension Unicode {
+  @_frozen // FIXME(sil-serialize-all)
   public enum UTF32 {
   case _swift3Codec
   }
 }
 
-extension _Unicode.UTF32 : UnicodeEncoding {
+extension Unicode.UTF32 : Unicode.Encoding {
   public typealias CodeUnit = UInt32
   public typealias EncodedScalar = CollectionOfOne<UInt32>
 
+  @_inlineable // FIXME(sil-serialize-all)
+  @_versioned // FIXME(sil-serialize-all)
+  internal static var _replacementCodeUnit: CodeUnit {
+    @inline(__always) get { return 0xFFFD }
+  }
+  
+  @_inlineable // FIXME(sil-serialize-all)
   public static var encodedReplacementCharacter : EncodedScalar {
-    return EncodedScalar(0xFFFD)
+    return EncodedScalar(_replacementCodeUnit)
   }
 
+  @_inlineable // FIXME(sil-serialize-all)
   @inline(__always)
   public static func _isScalar(_ x: CodeUnit) -> Bool  {
     return true
   }
 
+  @_inlineable // FIXME(sil-serialize-all)
   @inline(__always)
-  public static func decode(_ source: EncodedScalar) -> UnicodeScalar {
-    return UnicodeScalar(_unchecked: source.first!)
+  public static func decode(_ source: EncodedScalar) -> Unicode.Scalar {
+    return Unicode.Scalar(_unchecked: source.first!)
   }
 
+  @_inlineable // FIXME(sil-serialize-all)
   @inline(__always)
-  public static func encode(_ source: UnicodeScalar) -> EncodedScalar {
+  public static func encode(
+    _ source: Unicode.Scalar
+  ) -> EncodedScalar? {
     return EncodedScalar(source.value)
   }
   
+  @_fixed_layout // FIXME(sil-serialize-all)
   public struct Parser {
+    @_inlineable // FIXME(sil-serialize-all)
     public init() { }
   }
   
@@ -46,19 +61,20 @@ extension _Unicode.UTF32 : UnicodeEncoding {
   public typealias ReverseParser = Parser
 }
 
-extension UTF32.Parser : UnicodeParser {
-  public typealias Encoding = _Unicode.UTF32
+extension UTF32.Parser : Unicode.Parser {
+  public typealias Encoding = Unicode.UTF32
 
   /// Parses a single Unicode scalar value from `input`.
+  @_inlineable // FIXME(sil-serialize-all)
   public mutating func parseScalar<I : IteratorProtocol>(
     from input: inout I
-  ) -> _Unicode.ParseResult<Encoding.EncodedScalar>
+  ) -> Unicode.ParseResult<Encoding.EncodedScalar>
   where I.Element == Encoding.CodeUnit {
     let n = input.next()
     if _fastPath(n != nil), let x = n {
       // Check code unit is valid: not surrogate-reserved and within range.
       guard _fastPath((x &>> 11) != 0b1101_1 && x <= 0x10ffff)
-      else { return .invalid(length: 1) }
+      else { return .error(length: 1) }
       
       // x is a valid scalar.
       return .valid(UTF32.EncodedScalar(x))

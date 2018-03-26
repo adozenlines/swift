@@ -337,9 +337,10 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
 #define SIMPLE_DECL_ATTR(X, CLASS, ...) case DAK_##CLASS:
 #include "swift/AST/Attr.def"
   case DAK_Inline:
-  case DAK_Accessibility:
-  case DAK_Ownership:
+  case DAK_AccessControl:
+  case DAK_ReferenceOwnership:
   case DAK_Effects:
+  case DAK_Optimize:
     if (DeclAttribute::isDeclModifier(getKind())) {
       Printer.printKeyword(getAttrName());
     } else {
@@ -347,7 +348,7 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     }
     return true;
 
-  case DAK_SetterAccessibility:
+  case DAK_SetterAccess:
     Printer.printKeyword(getAttrName());
     Printer << "(set)";
     return true;
@@ -413,12 +414,7 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     Printer << ")";
     break;
   }
-  case DAK_AutoClosure:
-    Printer.printAttrName("@autoclosure");
-    if (cast<AutoClosureAttr>(this)->isEscaping())
-      Printer << "(escaping)";
-    break;
-      
+
   case DAK_CDecl:
     Printer << "@_cdecl(\"" << cast<CDeclAttr>(this)->Name << "\")";
     break;
@@ -493,24 +489,33 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     break;
   }
 
-  case DAK_NSKeyedArchiveLegacy: {
-    Printer.printAttrName("@NSKeyedArchiveLegacy");
+  case DAK_ObjCRuntimeName: {
+    Printer.printAttrName("@objc");
     Printer << "(";
-    auto *attr = cast<NSKeyedArchiveLegacyAttr>(this);
+    auto *attr = cast<ObjCRuntimeNameAttr>(this);
     Printer << "\"" << attr->Name << "\"";
     Printer << ")";
     break;
   }
 
-  case DAK_StaticInitializeObjCMetadata:
-    Printer.printAttrName("@_staticInitializeObjCMetadata");
+  case DAK_ClangImporterSynthesizedType: {
+    Printer.printAttrName("@_clangImporterSynthesizedType");
+    auto *attr = cast<ClangImporterSynthesizedTypeAttr>(this);
+    Printer << "(originalTypeName: \"" << attr->originalTypeName
+            << "\", manglingForKind: \"" << attr->getManglingName() << "\")";
     break;
+  }
 
   case DAK_Count:
     llvm_unreachable("exceed declaration attribute kinds");
 
+#define SIMPLE_DECL_ATTR(X, CLASS, ...) case DAK_##CLASS:
+#include "swift/AST/Attr.def"
+    llvm_unreachable("handled above");
+
   default:
-    llvm_unreachable("handled before this switch");
+    assert(DeclAttribute::isDeclModifier(getKind()) &&
+           "handled above");
   }
 
   return true;
@@ -564,10 +569,11 @@ StringRef DeclAttribute::getAttrName() const {
     return "_semantics";
   case DAK_Available:
     return "availability";
-  case DAK_AutoClosure:
-    return "autoclosure";
   case DAK_ObjC:
+  case DAK_ObjCRuntimeName:
     return "objc";
+  case DAK_RestatedObjCConformance:
+    return "_restatedObjCConformance";
   case DAK_Inline: {
     switch (cast<InlineAttr>(this)->getKind()) {
     case InlineKind::Never:
@@ -577,39 +583,57 @@ StringRef DeclAttribute::getAttrName() const {
     }
     llvm_unreachable("Invalid inline kind");
   }
+  case DAK_Optimize: {
+    switch (cast<OptimizeAttr>(this)->getMode()) {
+    case OptimizationMode::NoOptimization:
+      return "_optimize(none)";
+    case OptimizationMode::ForSpeed:
+      return "_optimize(speed)";
+    case OptimizationMode::ForSize:
+      return "_optimize(size)";
+    default:
+      llvm_unreachable("Invalid optimization kind");
+    }
+  }
   case DAK_Effects:
     switch (cast<EffectsAttr>(this)->getKind()) {
       case EffectsKind::ReadNone:
         return "effects(readnone)";
       case EffectsKind::ReadOnly:
         return "effects(readonly)";
+      case EffectsKind::ReleaseNone:
+        return "effects(releasenone)";
       case EffectsKind::ReadWrite:
         return "effects(readwrite)";
       case EffectsKind::Unspecified:
         return "effects(unspecified)";
     }
-  case DAK_Accessibility:
-  case DAK_SetterAccessibility:
-    switch (cast<AbstractAccessibilityAttr>(this)->getAccess()) {
-    case Accessibility::Private:
+  case DAK_AccessControl:
+  case DAK_SetterAccess:
+    switch (cast<AbstractAccessControlAttr>(this)->getAccess()) {
+    case AccessLevel::Private:
       return "private";
-    case Accessibility::FilePrivate:
+    case AccessLevel::FilePrivate:
       return "fileprivate";
-    case Accessibility::Internal:
+    case AccessLevel::Internal:
       return "internal";
-    case Accessibility::Public:
+    case AccessLevel::Public:
       return "public";
-    case Accessibility::Open:
+    case AccessLevel::Open:
       return "open";
     }
-    llvm_unreachable("bad accessibility kind");
+    llvm_unreachable("bad access level");
 
-  case DAK_Ownership:
-    switch (cast<OwnershipAttr>(this)->get()) {
-    case Ownership::Strong: llvm_unreachable("Never present in the attribute");
-    case Ownership::Weak:      return "weak";
-    case Ownership::Unowned:   return "unowned";
-    case Ownership::Unmanaged: return "unowned(unsafe)";
+  case DAK_ReferenceOwnership:
+    switch (cast<ReferenceOwnershipAttr>(this)->get()) {
+    case ReferenceOwnership::Strong:
+      llvm_unreachable("Never present in the attribute");
+    case ReferenceOwnership::Weak:
+      return "weak";
+    case ReferenceOwnership::Unowned:
+      return "unowned";
+    case ReferenceOwnership::Unmanaged:
+      return "unowned(unsafe)";
     }
     llvm_unreachable("bad ownership kind");
   case DAK_RawDocComment:
@@ -622,8 +646,8 @@ StringRef DeclAttribute::getAttrName() const {
     return "_specialize";
   case DAK_Implements:
     return "_implements";
-  case DAK_NSKeyedArchiveLegacy:
-    return "NSKeyedArchiveLegacy";
+  case DAK_ClangImporterSynthesizedType:
+    return "_clangImporterSynthesizedType";
   }
   llvm_unreachable("bad DeclAttrKind");
 }
@@ -673,7 +697,7 @@ ObjCAttr *ObjCAttr::createNullary(ASTContext &Ctx, SourceLoc AtLoc,
                                   SourceLoc NameLoc, Identifier Name,
                                   SourceLoc RParenLoc) {
   void *mem = Ctx.Allocate(totalSizeToAlloc<SourceLoc>(3), alignof(ObjCAttr));
-  return new (mem) ObjCAttr(AtLoc, SourceRange(ObjCLoc),
+  return new (mem) ObjCAttr(AtLoc, SourceRange(ObjCLoc, RParenLoc),
                             ObjCSelector(Ctx, 0, Name),
                             SourceRange(LParenLoc, RParenLoc),
                             NameLoc);
@@ -692,7 +716,7 @@ ObjCAttr *ObjCAttr::createSelector(ASTContext &Ctx, SourceLoc AtLoc,
   assert(NameLocs.size() == Names.size());
   void *mem = Ctx.Allocate(totalSizeToAlloc<SourceLoc>(NameLocs.size() + 2),
                            alignof(ObjCAttr));
-  return new (mem) ObjCAttr(AtLoc, SourceRange(ObjCLoc),
+  return new (mem) ObjCAttr(AtLoc, SourceRange(ObjCLoc, RParenLoc),
                             ObjCSelector(Ctx, Names.size(), Names),
                             SourceRange(LParenLoc, RParenLoc),
                             NameLocs);

@@ -37,30 +37,17 @@ namespace llvm {
 
 namespace swift {
   class ArchetypeType;
-  class AssociatedTypeDecl;
-  class ClassDecl;
-  class ConstructorDecl;
-  class Decl;
-  class ExtensionDecl;
-  class FuncDecl;
-  class EnumElementDecl;
-  class EnumType;
-  class Pattern;
-  class PatternBindingDecl;
+  class IRGenOptions;
   class SILDebugScope;
   class SILType;
-  class KeyPathInst;
   class SourceLoc;
-  class StructType;
-  class Substitution;
-  class ValueDecl;
-  class VarDecl;
 
 namespace Lowering {
   class TypeConverter;
 }
   
 namespace irgen {
+  class DynamicMetadataRequest;
   class Explosion;
   class FunctionRef;
   class HeapLayout;
@@ -68,6 +55,7 @@ namespace irgen {
   class IRGenModule;
   class LinkEntity;
   class LocalTypeDataCache;
+  class MetadataResponse;
   class Scope;
   class TypeInfo;
   enum class ValueWitness : unsigned;
@@ -80,12 +68,18 @@ public:
   IRGenModule &IGM;
   IRBuilder Builder;
 
+  /// If != OptimizationMode::NotSet, the optimization mode specified with an
+  /// function attribute.
+  OptimizationMode OptMode;
+
   llvm::Function *CurFn;
   ModuleDecl *getSwiftModule() const;
   SILModule &getSILModule() const;
   Lowering::TypeConverter &getSILTypes() const;
+  const IRGenOptions &getOptions() const;
 
   IRGenFunction(IRGenModule &IGM, llvm::Function *fn,
+                OptimizationMode Mode = OptimizationMode::NotSet,
                 const SILDebugScope *DbgScope = nullptr,
                 Optional<SILLocation> DbgLoc = None);
   ~IRGenFunction();
@@ -98,7 +92,7 @@ public:
 public:
   Explosion collectParameters();
   void emitScalarReturn(SILType resultTy, Explosion &scalars,
-                        bool isSwiftCCReturn);
+                        bool isSwiftCCReturn, bool isOutlined);
   void emitScalarReturn(llvm::Type *resultTy, Explosion &scalars);
   
   void emitBBForReturn();
@@ -113,6 +107,21 @@ public:
 
   /// Set the error result slot.
   void setErrorResultSlot(llvm::Value *address);
+
+  /// Are we currently emitting a coroutine?
+  bool isCoroutine() {
+    return CoroutineHandle != nullptr;
+  }
+  llvm::Value *getCoroutineHandle() {
+    assert(isCoroutine());
+    return CoroutineHandle;
+  }
+
+  void setCoroutineHandle(llvm::Value *handle) {
+    assert(CoroutineHandle == nullptr && "already set handle");
+    assert(handle != nullptr && "setting a null handle");
+    CoroutineHandle = handle;
+  }
   
 private:
   void emitPrologue();
@@ -121,14 +130,31 @@ private:
   Address ReturnSlot;
   llvm::BasicBlock *ReturnBB;
   llvm::Value *ErrorResultSlot = nullptr;
+  llvm::Value *CoroutineHandle = nullptr;
 
 //--- Helper methods -----------------------------------------------------------
 public:
+
+  /// Returns the optimization mode for the function. If no mode is set for the
+  /// function, returns the global mode, i.e. the mode in IRGenOptions.
+  OptimizationMode getEffectiveOptimizationMode() const;
+
+  /// Returns true if this function should be optimized for size.
+  bool optimizeForSize() const {
+    return getEffectiveOptimizationMode() == OptimizationMode::ForSize;
+  }
+
   Address createAlloca(llvm::Type *ty, Alignment align,
-                       const llvm::Twine &name);
-  Address createAlloca(llvm::Type *ty, llvm::Value *ArraySize, Alignment align,
-                       const llvm::Twine &name);
+                       const llvm::Twine &name = "");
+  Address createAlloca(llvm::Type *ty, llvm::Value *arraySize, Alignment align,
+                       const llvm::Twine &name = "");
   Address createFixedSizeBufferAlloca(const llvm::Twine &name);
+
+  StackAddress emitDynamicAlloca(SILType type, const llvm::Twine &name = "");
+  StackAddress emitDynamicAlloca(llvm::Type *eltTy, llvm::Value *arraySize,
+                                 Alignment align,
+                                 const llvm::Twine &name = "");
+  void emitDeallocateDynamicAlloca(StackAddress address);
 
   llvm::BasicBlock *createBasicBlock(const llvm::Twine &Name);
   const TypeInfo &getTypeInfoForUnlowered(Type subst);
@@ -150,6 +176,13 @@ public:
   Address emitByteOffsetGEP(llvm::Value *base, llvm::Value *offset,
                             const TypeInfo &type,
                             const llvm::Twine &name = "");
+  Address emitAddressAtOffset(llvm::Value *base, Offset offset,
+                              llvm::Type *objectType,
+                              Alignment objectAlignment,
+                              const llvm::Twine &name = "");
+
+  llvm::Value *emitInvariantLoad(Address address,
+                                 const llvm::Twine &name = "");
 
   void emitStoreOfRelativeIndirectablePointer(llvm::Value *value,
                                               Address addr,
@@ -167,6 +200,9 @@ public:
   llvm::Value *emitInitStackObjectCall(llvm::Value *metadata,
                                        llvm::Value *object,
                                        const llvm::Twine &name = "");
+  llvm::Value *emitInitStaticObjectCall(llvm::Value *metadata,
+                                        llvm::Value *object,
+                                        const llvm::Twine &name = "");
   llvm::Value *emitVerifyEndOfLifetimeCall(llvm::Value *object,
                                            const llvm::Twine &name = "");
   llvm::Value *emitAllocRawCall(llvm::Value *size, llvm::Value *alignMask,
@@ -188,12 +224,23 @@ public:
 
   llvm::Value *emitProjectBoxCall(llvm::Value *box, llvm::Value *typeMetadata);
 
+  llvm::Value *emitAllocEmptyBoxCall();
+
+  // Emit a call to the given generic type metadata access function.
+  MetadataResponse emitGenericTypeMetadataAccessFunctionCall(
+                                          llvm::Function *accessFunction,
+                                          ArrayRef<llvm::Value *> args,
+                                          DynamicMetadataRequest request);
+
   // Emit a reference to the canonical type metadata record for the given AST
   // type. This can be used to identify the type at runtime. For types with
   // abstraction difference, the metadata contains the layout information for
   // values in the maximally-abstracted representation of the type; this is
   // correct for all uses of reabstractable values in opaque contexts.
   llvm::Value *emitTypeMetadataRef(CanType type);
+
+  MetadataResponse emitTypeMetadataRef(CanType type,
+                                       DynamicMetadataRequest request);
 
   // Emit a reference to a type layout record for the given type. The referenced
   // data is enough to lay out an aggregate containing a value of the type, but
@@ -213,11 +260,14 @@ public:
   llvm::Value *emitTypeMetadataRefForLayout(SILType type);
   
   llvm::Value *emitValueWitnessTableRef(CanType type);
-  llvm::Value *emitValueWitnessTableRefForLayout(SILType type);
+  llvm::Value *emitValueWitnessTableRef(SILType type,
+                                        llvm::Value **metadataSlot = nullptr);
   llvm::Value *emitValueWitnessTableRefForMetadata(llvm::Value *metadata);
   
-  llvm::Value *emitValueWitness(CanType type, ValueWitness index);
-  llvm::Value *emitValueWitnessForLayout(SILType type, ValueWitness index);
+  llvm::Value *emitValueWitnessValue(SILType type, ValueWitness index);
+  FunctionPointer emitValueWitnessFunctionRef(SILType type,
+                                              llvm::Value *&metadataSlot,
+                                              ValueWitness index);
 
   /// Emit a load of a reference to the given Objective-C selector.
   llvm::Value *emitObjCSelectorRefLoad(StringRef selector);
@@ -231,6 +281,9 @@ public:
   void setInvariantLoad(llvm::LoadInst *load);
   /// Mark a load as dereferenceable to `size` bytes.
   void setDereferenceableLoad(llvm::LoadInst *load, unsigned size);
+
+  /// Emit a non-mergeable trap call, optionally followed by a terminator.
+  void emitTrap(bool EmitUnreachable);
 
 private:
   llvm::Instruction *AllocaIP;
@@ -388,6 +441,8 @@ public:
   llvm::Value *emitIsUniqueCall(llvm::Value *value, SourceLoc loc,
                                 bool isNonNull, bool checkPinned);
 
+  llvm::Value *emitIsEscapingClosureCall(llvm::Value *value, SourceLoc loc);
+
 //--- Expression emission ------------------------------------------------------
 public:
   void emitFakeExplosion(const TypeInfo &type, Explosion &explosion);
@@ -408,6 +463,9 @@ public:
     return tryGetLocalTypeData(LocalTypeDataKey{type, kind});
   }
   llvm::Value *tryGetLocalTypeData(LocalTypeDataKey key);
+
+  MetadataResponse tryGetLocalTypeMetadata(CanType type,
+                                           DynamicMetadataRequest request);
 
   /// Look up a local type data reference, returning null if no entry was
   /// found or if the only viable entries are abstract.  This will never
@@ -432,6 +490,7 @@ public:
     setScopedLocalTypeData(LocalTypeDataKey{type, kind}, data);
   }
   void setScopedLocalTypeData(LocalTypeDataKey key, llvm::Value *data);
+  void setScopedLocalTypeMetadata(CanType type, MetadataResponse response);
 
   /// The same as tryGetLocalTypeData, just for the Layout metadata.
   ///
@@ -454,6 +513,13 @@ public:
   /// that we can reach from it.
   void bindLocalTypeDataFromTypeMetadata(CanType type, IsExact_t isExact,
                                          llvm::Value *metadata);
+
+  /// Given the witness table parameter, bind local type data for
+  /// the witness table itself and any conditional requirements.
+  void bindLocalTypeDataFromSelfWitnessTable(
+                const ProtocolConformance *conformance,
+                llvm::Value *selfTable,
+                llvm::function_ref<CanType (CanType)> mapTypeIntoContext);
 
   void setDominanceResolver(DominanceResolverFunction resolver) {
     assert(DominanceResolver == nullptr);
@@ -552,7 +618,7 @@ public:
 
   llvm::Value *getLocalSelfMetadata();
   void setLocalSelfMetadata(llvm::Value *value, LocalSelfKind kind);
-  
+
 private:
   LocalTypeDataCache &getOrCreateLocalTypeData();
   void destroyLocalTypeData();

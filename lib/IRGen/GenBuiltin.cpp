@@ -27,6 +27,7 @@
 
 #include "Explosion.h"
 #include "GenCall.h"
+#include "GenCast.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
 #include "LoadableTypeInfo.h"
@@ -115,13 +116,10 @@ getLoweredTypeAndTypeInfo(IRGenModule &IGM, Type unloweredType) {
 }
 
 /// emitBuiltinCall - Emit a call to a builtin function.
-void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
-                            SILType resultType,
+void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
+                            Identifier FnId, SILType resultType,
                             Explosion &args, Explosion &out,
                             SubstitutionList substitutions) {
-  // Decompose the function's name into a builtin name and type list.
-  const BuiltinInfo &Builtin = IGF.getSILModule().getBuiltinInfo(FnId);
-
   if (Builtin.ID == BuiltinValueKind::UnsafeGuaranteedEnd) {
     // Just consume the incoming argument.
     assert(args.size() == 1 && "Expecting one incoming argument");
@@ -196,10 +194,21 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
   const IntrinsicInfo &IInfo = IGF.getSILModule().getIntrinsicInfo(FnId);
   llvm::Intrinsic::ID IID = IInfo.ID;
 
+  // Emit non-mergeable traps only.
+  if (IGF.Builder.isTrapIntrinsic(IID)) {
+    IGF.Builder.CreateNonMergeableTrap(IGF.IGM);
+    return;
+  }
+
   // Calls to the int_instrprof_increment intrinsic are emitted during SILGen.
   // At that stage, the function name GV used by the profiling pass is hidden.
   // Fix the intrinsic call here by pointing it to the correct GV.
   if (IID == llvm::Intrinsic::instrprof_increment) {
+    // If we import profiling intrinsics from a swift module but profiling is
+    // not enabled, ignore the increment.
+    if (!IGF.getSILModule().getOptions().GenerateProfile)
+      return;
+
     // Extract the PGO function name.
     auto *NameGEP = cast<llvm::User>(args.claimNext());
     auto *NameGV = dyn_cast<llvm::GlobalVariable>(NameGEP->stripPointerCasts());
@@ -212,13 +221,15 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
       std::string PGOFuncNameVar = llvm::getPGOFuncNameVarName(
           PGOFuncName, llvm::GlobalValue::LinkOnceAnyLinkage);
       auto *FuncNamePtr = IGF.IGM.Module.getNamedGlobal(PGOFuncNameVar);
+      if (!FuncNamePtr)
+        FuncNamePtr = llvm::createPGOFuncNameVar(
+            *IGF.IGM.getModule(), llvm::GlobalValue::LinkOnceAnyLinkage,
+            PGOFuncName);
 
-      if (FuncNamePtr) {
-        llvm::SmallVector<llvm::Value *, 2> Indices(2, NameGEP->getOperand(1));
-        NameGEP = llvm::ConstantExpr::getGetElementPtr(
-            ((llvm::PointerType *)FuncNamePtr->getType())->getElementType(),
-            FuncNamePtr, makeArrayRef(Indices));
-      }
+      llvm::SmallVector<llvm::Value *, 2> Indices(2, NameGEP->getOperand(1));
+      NameGEP = llvm::ConstantExpr::getGetElementPtr(
+          ((llvm::PointerType *)FuncNamePtr->getType())->getElementType(),
+          FuncNamePtr, makeArrayRef(Indices));
     }
 
     // Replace the placeholder value with the new GEP.
@@ -247,7 +258,14 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
     return;
   }
 
-  // TODO: A linear series of ifs is suboptimal.
+  if (Builtin.ID == BuiltinValueKind::StringObjectOr) {
+    llvm::Value *lhs = args.claimNext();
+    llvm::Value *rhs = args.claimNext();
+    llvm::Value *v = IGF.Builder.CreateOr(lhs, rhs);
+    return out.add(v);
+  }
+
+    // TODO: A linear series of ifs is suboptimal.
 #define BUILTIN_SIL_OPERATION(id, name, overload) \
   if (Builtin.ID == BuiltinValueKind::id) \
     llvm_unreachable(name " builtin should be lowered away by SILGen!");
@@ -270,14 +288,14 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, Identifier FnId,
     return out.add(v); \
   }
 
-#define BUILTIN_RUNTIME_CALL(id, name, attrs) \
-  if (Builtin.ID == BuiltinValueKind::id) { \
-    llvm::CallInst *call = IGF.Builder.CreateCall(IGF.IGM.get##id##Fn(),  \
-                           args.claimNext()); \
-    call->setCallingConv(IGF.IGM.DefaultCC); \
-    call->setDoesNotThrow(); \
-    return out.add(call); \
- }
+#define BUILTIN_RUNTIME_CALL(id, name, attrs)                                  \
+  if (Builtin.ID == BuiltinValueKind::id) {                                    \
+    auto *fn = cast<llvm::Function>(IGF.IGM.get##id##Fn());                    \
+    llvm::CallInst *call = IGF.Builder.CreateCall(fn, args.claimNext());       \
+    call->setCallingConv(fn->getCallingConv());                                \
+    call->setAttributes(fn->getAttributes());                                  \
+    return out.add(call);                                                      \
+  }
 
 #define BUILTIN_BINARY_OPERATION_WITH_OVERFLOW(id, name, uncheckedID, attrs, overload) \
 if (Builtin.ID == BuiltinValueKind::id) { \
@@ -385,8 +403,9 @@ if (Builtin.ID == BuiltinValueKind::id) { \
       BuiltinName = BuiltinName.drop_front(strlen("_singlethread"));
     assert(BuiltinName.empty() && "Mismatch with sema");
     
-    IGF.Builder.CreateFence(ordering,
-                      isSingleThread ? llvm::SingleThread : llvm::CrossThread);
+    IGF.Builder.CreateFence(ordering, isSingleThread
+                                          ? llvm::SyncScope::SingleThread
+                                          : llvm::SyncScope::System);
     return;
   }
 
@@ -435,10 +454,10 @@ if (Builtin.ID == BuiltinValueKind::id) { \
 
     pointer = IGF.Builder.CreateBitCast(pointer,
                                   llvm::PointerType::getUnqual(cmp->getType()));
-    llvm::Value *value = IGF.Builder.CreateAtomicCmpXchg(pointer, cmp, newval,
-                                                         successOrdering,
-                                                         failureOrdering,
-                                                         isSingleThread ? llvm::SingleThread : llvm::CrossThread);
+    llvm::Value *value = IGF.Builder.CreateAtomicCmpXchg(
+        pointer, cmp, newval, successOrdering, failureOrdering,
+        isSingleThread ? llvm::SyncScope::SingleThread
+                       : llvm::SyncScope::System);
     cast<llvm::AtomicCmpXchgInst>(value)->setVolatile(isVolatile);
     cast<llvm::AtomicCmpXchgInst>(value)->setWeak(isWeak);
 
@@ -503,9 +522,10 @@ if (Builtin.ID == BuiltinValueKind::id) { \
 
     pointer = IGF.Builder.CreateBitCast(pointer,
                                   llvm::PointerType::getUnqual(val->getType()));
-    llvm::Value *value = IGF.Builder.CreateAtomicRMW(SubOpcode, pointer, val,
-                                                      ordering,
-                      isSingleThread ? llvm::SingleThread : llvm::CrossThread);
+    llvm::Value *value = IGF.Builder.CreateAtomicRMW(
+        SubOpcode, pointer, val, ordering,
+        isSingleThread ? llvm::SyncScope::SingleThread
+                       : llvm::SyncScope::System);
     cast<AtomicRMWInst>(value)->setVolatile(isVolatile);
 
     if (origTy->isPointerTy())
@@ -557,8 +577,8 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     if (Builtin.ID == BuiltinValueKind::AtomicLoad) {
       auto load = IGF.Builder.CreateLoad(pointer,
                                          valueTI.getBestKnownAlignment());
-      load->setAtomic(ordering,
-                      isSingleThread ? llvm::SingleThread : llvm::CrossThread);
+      load->setAtomic(ordering, isSingleThread ? llvm::SyncScope::SingleThread
+                                               : llvm::SyncScope::System);
       load->setVolatile(isVolatile);
 
       llvm::Value *value = load;
@@ -572,8 +592,8 @@ if (Builtin.ID == BuiltinValueKind::id) { \
         value = IGF.Builder.CreateBitCast(value, valueTy);
       auto store = IGF.Builder.CreateStore(value, pointer,
                                            valueTI.getBestKnownAlignment());
-      store->setAtomic(ordering,
-                       isSingleThread ? llvm::SingleThread : llvm::CrossThread);
+      store->setAtomic(ordering, isSingleThread ? llvm::SyncScope::SingleThread
+                                                : llvm::SyncScope::System);
       store->setVolatile(isVolatile);
       return;
     } else {
@@ -781,10 +801,15 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     valueTy.second.destroyArray(IGF, array, count, valueTy.first);
     return;
   }
-  
-  if (Builtin.ID == BuiltinValueKind::CopyArray
-      || Builtin.ID == BuiltinValueKind::TakeArrayFrontToBack
-      || Builtin.ID == BuiltinValueKind::TakeArrayBackToFront) {
+
+  if (Builtin.ID == BuiltinValueKind::CopyArray ||
+      Builtin.ID == BuiltinValueKind::TakeArrayNoAlias ||
+      Builtin.ID == BuiltinValueKind::TakeArrayFrontToBack ||
+      Builtin.ID == BuiltinValueKind::TakeArrayBackToFront ||
+      Builtin.ID == BuiltinValueKind::AssignCopyArrayNoAlias ||
+      Builtin.ID == BuiltinValueKind::AssignCopyArrayFrontToBack ||
+      Builtin.ID == BuiltinValueKind::AssignCopyArrayBackToFront ||
+      Builtin.ID == BuiltinValueKind::AssignTakeArray) {
     // The input type is (T.Type, Builtin.RawPointer, Builtin.RawPointer, Builtin.Word).
     /* metatype (which may be thin) */
     if (args.size() == 4)
@@ -808,6 +833,10 @@ if (Builtin.ID == BuiltinValueKind::id) { \
       valueTy.second.initializeArrayWithCopy(IGF, destArray, srcArray, count,
                                              valueTy.first);
       break;
+    case BuiltinValueKind::TakeArrayNoAlias:
+      valueTy.second.initializeArrayWithTakeNoAlias(IGF, destArray, srcArray,
+                                                    count, valueTy.first);
+      break;
     case BuiltinValueKind::TakeArrayFrontToBack:
       valueTy.second.initializeArrayWithTakeFrontToBack(IGF, destArray, srcArray,
                                                         count, valueTy.first);
@@ -815,6 +844,22 @@ if (Builtin.ID == BuiltinValueKind::id) { \
     case BuiltinValueKind::TakeArrayBackToFront:
       valueTy.second.initializeArrayWithTakeBackToFront(IGF, destArray, srcArray,
                                                         count, valueTy.first);
+      break;
+    case BuiltinValueKind::AssignCopyArrayNoAlias:
+      valueTy.second.assignArrayWithCopyNoAlias(IGF, destArray, srcArray, count,
+                                                valueTy.first);
+      break;
+    case BuiltinValueKind::AssignCopyArrayFrontToBack:
+      valueTy.second.assignArrayWithCopyFrontToBack(IGF, destArray, srcArray,
+                                                    count, valueTy.first);
+      break;
+    case BuiltinValueKind::AssignCopyArrayBackToFront:
+      valueTy.second.assignArrayWithCopyBackToFront(IGF, destArray, srcArray,
+                                                    count, valueTy.first);
+      break;
+    case BuiltinValueKind::AssignTakeArray:
+      valueTy.second.assignArrayWithTake(IGF, destArray, srcArray, count,
+                                         valueTy.first);
       break;
     default:
       llvm_unreachable("out of sync with if condition");
@@ -859,23 +904,55 @@ if (Builtin.ID == BuiltinValueKind::id) { \
   }
 
   if (Builtin.ID == BuiltinValueKind::Swift3ImplicitObjCEntrypoint) {
-    llvm::Value *args[2];
+    llvm::Value *entrypointArgs[7];
     auto argIter = IGF.CurFn->arg_begin();
 
     // self
-    args[0] = &*argIter++;
-    if (args[0]->getType() != IGF.IGM.ObjCPtrTy)
-      args[0] = IGF.Builder.CreateBitCast(args[0], IGF.IGM.ObjCPtrTy);
+    entrypointArgs[0] = &*argIter++;
+    if (entrypointArgs[0]->getType() != IGF.IGM.ObjCPtrTy)
+      entrypointArgs[0] = IGF.Builder.CreateBitCast(entrypointArgs[0], IGF.IGM.ObjCPtrTy);
 
     // _cmd
-    args[1] = &*argIter;
-    if (args[1]->getType() != IGF.IGM.ObjCSELTy)
-      args[1] = IGF.Builder.CreateBitCast(args[1], IGF.IGM.ObjCSELTy);
+    entrypointArgs[1] = &*argIter;
+    if (entrypointArgs[1]->getType() != IGF.IGM.ObjCSELTy)
+      entrypointArgs[1] = IGF.Builder.CreateBitCast(entrypointArgs[1], IGF.IGM.ObjCSELTy);
+    
+    // Filename pointer
+    entrypointArgs[2] = args.claimNext();
+    // Filename length
+    entrypointArgs[3] = args.claimNext();
+    // Line
+    entrypointArgs[4] = args.claimNext();
+    // Column
+    entrypointArgs[5] = args.claimNext();
+    
+    // Create a flag variable so that this invocation logs only once.
+    auto flagStorageTy = llvm::ArrayType::get(IGF.IGM.Int8Ty,
+                                        IGF.IGM.getAtomicBoolSize().getValue());
+    auto flag = new llvm::GlobalVariable(IGF.IGM.Module, flagStorageTy,
+                               /*constant*/ false,
+                               llvm::GlobalValue::PrivateLinkage,
+                               llvm::ConstantAggregateZero::get(flagStorageTy));
+    flag->setAlignment(IGF.IGM.getAtomicBoolAlignment().getValue());
+    entrypointArgs[6] = llvm::ConstantExpr::getBitCast(flag, IGF.IGM.Int8PtrTy);
 
-    IGF.Builder.CreateCall(IGF.IGM.getSwift3ImplicitObjCEntrypointFn(), args);
+    IGF.Builder.CreateCall(IGF.IGM.getSwift3ImplicitObjCEntrypointFn(),
+                           entrypointArgs);
     return;
   }
 
+  if (Builtin.ID == BuiltinValueKind::IsSameMetatype) {
+    auto metatypeLHS = args.claimNext();
+    auto metatypeRHS = args.claimNext();
+    (void)args.claimAll();
+    llvm::Value *metatypeLHSCasted =
+        IGF.Builder.CreateBitCast(metatypeLHS, IGF.IGM.Int8PtrTy);
+    llvm::Value *metatypeRHSCasted =
+        IGF.Builder.CreateBitCast(metatypeRHS, IGF.IGM.Int8PtrTy);
+
+    out.add(IGF.Builder.CreateICmpEQ(metatypeLHSCasted, metatypeRHSCasted));
+    return;
+  }
 
   llvm_unreachable("IRGen unimplemented for this builtin!");
 }

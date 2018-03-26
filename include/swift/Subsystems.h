@@ -19,8 +19,8 @@
 
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/OptionSet.h"
+#include "swift/Basic/PrimarySpecificPaths.h"
 #include "swift/Basic/Version.h"
-#include "swift/Syntax/TokenSyntax.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Optional.h"
@@ -63,13 +63,14 @@ namespace swift {
   class Token;
   class TopLevelContext;
   struct TypeLoc;
+  class UnifiedStatsReporter;
 
-  /// SILParserState - This is a context object used to optionally maintain SIL
-  /// parsing context for the parser.
+  /// Used to optionally maintain SIL parsing context for the parser.
+  ///
+  /// When not parsing SIL, this has no overhead.
   class SILParserState {
   public:
-    SILModule *M;
-    SILParserTUState *S;
+    std::unique_ptr<SILParserTUState> Impl;
 
     explicit SILParserState(SILModule *M);
     ~SILParserState();
@@ -127,19 +128,10 @@ namespace swift {
   std::vector<Token> tokenize(const LangOptions &LangOpts,
                               const SourceManager &SM, unsigned BufferID,
                               unsigned Offset = 0, unsigned EndOffset = 0,
+                              DiagnosticEngine *Diags = nullptr,
                               bool KeepComments = true,
                               bool TokenizeInterpolatedString = true,
                               ArrayRef<Token> SplitTokens = ArrayRef<Token>());
-
-  /// \brief Lex and return a vector of `RC<TokenSyntax>` tokens, which include
-  /// leading and trailing trivia.
-  std::vector<std::pair<RC<syntax::TokenSyntax>,
-                                   syntax::AbsolutePosition>>
-  tokenizeWithTrivia(const LangOptions &LangOpts,
-                     const SourceManager &SM,
-                     unsigned BufferID,
-                     unsigned Offset = 0,
-                     unsigned EndOffset = 0);
 
   /// Once parsing is complete, this walks the AST to resolve imports, record
   /// operators, and do other top-level validation.
@@ -190,11 +182,9 @@ namespace swift {
   void performTypeChecking(SourceFile &SF, TopLevelContext &TLC,
                            OptionSet<TypeCheckingFlags> Options,
                            unsigned StartElem = 0,
-                           unsigned WarnLongFunctionBodies = 0);
-
-  /// Once type checking is complete, this walks protocol requirements
-  /// to resolve default witnesses.
-  void finishTypeChecking(SourceFile &SF);
+                           unsigned WarnLongFunctionBodies = 0,
+                           unsigned WarnLongExpressionTypeChecking = 0,
+                           unsigned ExpressionTimeoutThreshold = 0);
 
   /// Now that we have type-checked an entire module, perform any type
   /// checking that requires the full module, e.g., Objective-C method
@@ -240,25 +230,19 @@ namespace swift {
   ///
   /// The module must contain source files.
   ///
-  /// If \p makeModuleFragile is true, all functions and global variables of
-  /// the module are marked as fragile. This is used for compiling the stdlib.
   /// if \p wholeModuleCompilation is true, the optimizer assumes that the SIL
   /// of all files in the module is present in the SILModule.
   std::unique_ptr<SILModule>
   performSILGeneration(ModuleDecl *M, SILOptions &options,
-                       bool makeModuleFragile = false,
                        bool wholeModuleCompilation = false);
 
   /// Turn a source file into SIL IR.
   ///
   /// If \p StartElem is provided, the module is assumed to be only part of the
   /// SourceFile, and any optimizations should take that into account.
-  /// If \p makeModuleFragile is true, all functions and global variables of
-  /// the module are marked as fragile. This is used for compiling the stdlib.
   std::unique_ptr<SILModule>
   performSILGeneration(FileUnit &SF, SILOptions &options,
-                       Optional<unsigned> StartElem = None,
-                       bool makeModuleFragile = false);
+                       Optional<unsigned> StartElem = None);
 
   using ModuleOrSourceFile = PointerUnion<ModuleDecl *, SourceFile *>;
 
@@ -266,8 +250,9 @@ namespace swift {
   void serialize(ModuleOrSourceFile DC, const SerializationOptions &options,
                  const SILModule *M = nullptr);
 
-  /// Get the CPU and subtarget feature options to use when emitting code.
-  std::tuple<llvm::TargetOptions, std::string, std::vector<std::string>>
+  /// Get the CPU, subtarget feature options, and triple to use when emitting code.
+  std::tuple<llvm::TargetOptions, std::string, std::vector<std::string>,
+             std::string>
   getIRTargetOptions(IRGenOptions &Opts, ASTContext &Ctx);
 
   /// Turn the given Swift module into either LLVM IR or native code
@@ -276,7 +261,9 @@ namespace swift {
   std::unique_ptr<llvm::Module>
   performIRGeneration(IRGenOptions &Opts, ModuleDecl *M,
                       std::unique_ptr<SILModule> SILMod,
-                      StringRef ModuleName, llvm::LLVMContext &LLVMContext,
+                      StringRef ModuleName, const PrimarySpecificPaths &PSPs,
+                      llvm::LLVMContext &LLVMContext,
+                      ArrayRef<std::string> parallelOutputFilenames,
                       llvm::GlobalVariable **outModuleHash = nullptr);
 
   /// Turn the given Swift module into either LLVM IR or native code
@@ -285,7 +272,8 @@ namespace swift {
   std::unique_ptr<llvm::Module>
   performIRGeneration(IRGenOptions &Opts, SourceFile &SF,
                       std::unique_ptr<SILModule> SILMod,
-                      StringRef ModuleName, llvm::LLVMContext &LLVMContext,
+                      StringRef ModuleName, const PrimarySpecificPaths &PSPs,
+                      llvm::LLVMContext &LLVMContext,
                       unsigned StartElem = 0,
                       llvm::GlobalVariable **outModuleHash = nullptr);
 
@@ -300,8 +288,9 @@ namespace swift {
                                    StringRef OutputPath);
 
   /// Turn the given LLVM module into native code and return true on error.
-  bool performLLVM(IRGenOptions &Opts, ASTContext &Ctx,
-                   llvm::Module *Module);
+  bool performLLVM(IRGenOptions &Opts, ASTContext &Ctx, llvm::Module *Module,
+                   StringRef OutputFilename,
+                   UnifiedStatsReporter *Stats=nullptr);
 
   /// Run the LLVM passes. In multi-threaded compilation this will be done for
   /// multiple LLVM modules in parallel.
@@ -320,7 +309,8 @@ namespace swift {
                    llvm::Module *Module,
                    llvm::TargetMachine *TargetMachine,
                    const version::Version &effectiveLanguageVersion,
-                   StringRef OutputFilename);
+                   StringRef OutputFilename,
+                   UnifiedStatsReporter *Stats=nullptr);
 
   /// Creates a TargetMachine from the IRGen opts and AST Context.
   std::unique_ptr<llvm::TargetMachine>

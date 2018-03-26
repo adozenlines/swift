@@ -75,9 +75,9 @@ struct P5Conformer : P5 { // expected-error {{does not conform}}
 
 
 protocol P6Base {
-  associatedtype Foo
+  associatedtype Foo // expected-note{{protocol requires nested type 'Foo'; do you want to add it?}}
   func foo()
-  func bar() -> Foo // expected-note{{protocol requires function 'bar()' with type '() -> P6Conformer.Bar?'; do you want to add a stub?}}
+  func bar() -> Foo
 }
 extension P6Base {
 }
@@ -85,7 +85,7 @@ protocol P6 : P6Base {
   associatedtype Bar // expected-note {{protocol requires nested type 'Bar'}}
 }
 extension P6 {
-  func bar() -> Bar? { return nil } // expected-note{{candidate has non-matching type '<Self> () -> Self.Bar?' [with Foo = P6Conformer.Bar?]}}
+  func bar() -> Bar? { return nil }
 }
 
 struct P6Conformer : P6 { // expected-error 2 {{does not conform}}
@@ -100,9 +100,10 @@ struct A: OptionSet {
   init() { } // expected-note 2{{candidate has non-matching type '()'}}
 }
 
+// Type witness cannot have its own generic parameters
 // FIXME: Crappy diagnostic
 protocol PA {
-  associatedtype A // expected-note 2 {{protocol requires nested type 'A'; do you want to add it?}}
+  associatedtype A // expected-note 3 {{protocol requires nested type 'A'; do you want to add it?}}
 }
 
 struct BadCase1 : PA { // expected-error {{type 'BadCase1' does not conform to protocol 'PA'}}
@@ -112,3 +113,21 @@ struct BadCase1 : PA { // expected-error {{type 'BadCase1' does not conform to p
 struct BadCase2 : PA { // expected-error {{type 'BadCase2' does not conform to protocol 'PA'}}
   typealias A<T> = T
 }
+
+// Variation on the above
+struct G<T> {}
+
+struct BadCase3 : PA { // expected-error {{type 'BadCase3' does not conform to protocol 'PA'}}
+  typealias A = G
+}
+
+// rdar://problem/32215763
+extension UInt32: ExpressibleByStringLiteral {}
+// expected-error@-1 {{type 'UInt32' does not conform to protocol 'ExpressibleByStringLiteral'}}
+// expected-error@-2 {{type 'UInt32' does not conform to protocol 'ExpressibleByExtendedGraphemeClusterLiteral'}}
+// expected-error@-3 {{type 'UInt32' does not conform to protocol 'ExpressibleByUnicodeScalarLiteral'}}
+
+// After successfully type-checking this (due to the presumption of
+// the type actually conforming), do not crash when failing to find
+// the associated witness type.
+let diagnose: UInt32 = "reta"

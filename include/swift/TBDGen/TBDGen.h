@@ -12,13 +12,25 @@
 #ifndef SWIFT_IRGEN_TBDGEN_H
 #define SWIFT_IRGEN_TBDGEN_H
 
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
+
+namespace llvm {
+class raw_ostream;
+}
 
 namespace swift {
 class FileUnit;
+class ModuleDecl;
 
 void enumeratePublicSymbols(FileUnit *module, llvm::StringSet<> &symbols,
-                            bool hasMultipleIRGenThreads, bool isWholeModule);
+                            bool hasMultipleIGMs);
+void enumeratePublicSymbols(ModuleDecl *module, llvm::StringSet<> &symbols,
+                            bool hasMultipleIGMs);
+
+void writeTBDFile(ModuleDecl *M, llvm::raw_ostream &os, bool hasMultipleIGMs,
+                  llvm::StringRef installName);
+
 } // end namespace swift
 
 #endif

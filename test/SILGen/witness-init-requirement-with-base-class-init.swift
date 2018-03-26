@@ -1,5 +1,5 @@
-// RUN: %target-swift-frontend -emit-silgen %s | %FileCheck %s
-// RUN: %target-swift-frontend -emit-sil -verify %s
+// RUN: %target-swift-frontend -enable-sil-ownership -emit-silgen %s | %FileCheck %s
+// RUN: %target-swift-frontend -enable-sil-ownership -emit-sil -verify %s
 
 protocol BestFriend: class {
   init()
@@ -14,9 +14,9 @@ class Animal {
 }
 
 class Dog: Animal, BestFriend {}
-// CHECK-LABEL: sil private [transparent] [thunk] @_T04main3DogCAA10BestFriendA2aDPxycfCTW
+// CHECK-LABEL: sil private [transparent] [thunk] @$S4main3DogCAA10BestFriendA2aDPxycfCTW
 // CHECK:         [[SELF:%.*]] = apply
 // CHECK:         unchecked_ref_cast [[SELF]] : $Animal to $Dog
-// CHECK-LABEL: sil private [transparent] [thunk] @_T04main3DogCAA10BestFriendA2aDP6createxyFZTW
+// CHECK-LABEL: sil private [transparent] [thunk] @$S4main3DogCAA10BestFriendA2aDP6createxyFZTW
 // CHECK:         [[SELF:%.*]] = apply
 // CHECK:         unchecked_ref_cast [[SELF]] : $Animal to $Dog

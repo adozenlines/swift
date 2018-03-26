@@ -10,33 +10,77 @@
 //
 //===----------------------------------------------------------------------===//
 
-internal enum _JoinIteratorState {
-  case start
-  case generatingElements
-  case generatingSeparator
-  case end
-}
+/// A sequence that presents the elements of a base sequence of sequences
+/// concatenated using a given separator.
+@_fixed_layout // FIXME(sil-serialize-all)
+public struct JoinedSequence<Base : Sequence> where Base.Element : Sequence {
 
-/// An iterator that presents the elements of the sequences traversed
-/// by a base iterator, concatenated using a given separator.
-public struct JoinedIterator<Base : IteratorProtocol> : IteratorProtocol
-  where Base.Element : Sequence {
+  public typealias Element = Base.Element.Element
+  
+  @_versioned // FIXME(sil-serialize-all)
+  internal var _base: Base
+  @_versioned // FIXME(sil-serialize-all)
+  internal var _separator: ContiguousArray<Element>
 
   /// Creates an iterator that presents the elements of the sequences
   /// traversed by `base`, concatenated using `separator`.
   ///
   /// - Complexity: O(`separator.count`).
+  @_inlineable // FIXME(sil-serialize-all)
   public init<Separator : Sequence>(base: Base, separator: Separator)
-    where Separator.Iterator.Element == Base.Element.Iterator.Element {
+    where Separator.Element == Element {
     self._base = base
-    self._separatorData = ContiguousArray(separator)
+    self._separator = ContiguousArray(separator)
   }
+}
+
+extension JoinedSequence {
+  /// An iterator that presents the elements of the sequences traversed
+  /// by a base iterator, concatenated using a given separator.
+  @_fixed_layout // FIXME(sil-serialize-all)
+  public struct Iterator {
+    @_versioned // FIXME(sil-serialize-all)
+    internal var _base: Base.Iterator
+    @_versioned // FIXME(sil-serialize-all)
+    internal var _inner: Base.Element.Iterator?
+    @_versioned // FIXME(sil-serialize-all)
+    internal var _separatorData: ContiguousArray<Element>
+    @_versioned // FIXME(sil-serialize-all)
+    internal var _separator: ContiguousArray<Element>.Iterator?
+    
+    @_frozen // FIXME(sil-serialize-all)
+    @_versioned // FIXME(sil-serialize-all)
+    internal enum JoinIteratorState {
+      case start
+      case generatingElements
+      case generatingSeparator
+      case end
+    }
+    @_versioned // FIXME(sil-serialize-all)
+    internal var _state: JoinIteratorState = .start
+
+    /// Creates a sequence that presents the elements of `base` sequences
+    /// concatenated using `separator`.
+    ///
+    /// - Complexity: O(`separator.count`).
+    @_inlineable // FIXME(sil-serialize-all)
+    public init<Separator: Sequence>(base: Base.Iterator, separator: Separator)
+      where Separator.Element == Element {
+      self._base = base
+      self._separatorData = ContiguousArray(separator)
+    }
+  }  
+}
+
+extension JoinedSequence.Iterator: IteratorProtocol {
+  public typealias Element = Base.Element.Element
 
   /// Advances to the next element and returns it, or `nil` if no next element
   /// exists.
   ///
   /// Once `nil` has been returned, all subsequent calls return `nil`.
-  public mutating func next() -> Base.Element.Iterator.Element? {
+  @_inlineable // FIXME(sil-serialize-all)
+  public mutating func next() -> Element? {
     while true {
       switch _state {
       case .start:
@@ -72,46 +116,23 @@ public struct JoinedIterator<Base : IteratorProtocol> : IteratorProtocol
 
       case .end:
         return nil
-
       }
     }
   }
-
-  internal var _base: Base
-  internal var _inner: Base.Element.Iterator?
-  internal var _separatorData: ContiguousArray<Base.Element.Iterator.Element>
-  internal var _separator:
-    ContiguousArray<Base.Element.Iterator.Element>.Iterator?
-  internal var _state: _JoinIteratorState = .start
 }
 
-/// A sequence that presents the elements of a base sequence of sequences
-/// concatenated using a given separator.
-public struct JoinedSequence<Base : Sequence> : Sequence
-  where Base.Iterator.Element : Sequence {
-
-  /// Creates a sequence that presents the elements of `base` sequences
-  /// concatenated using `separator`.
-  ///
-  /// - Complexity: O(`separator.count`).
-  public init<Separator : Sequence>(base: Base, separator: Separator)
-    where Separator.Iterator.Element == Base.Iterator.Element.Iterator.Element {
-    self._base = base
-    self._separator = ContiguousArray(separator)
-  }
-
+extension JoinedSequence: Sequence {
   /// Return an iterator over the elements of this sequence.
   ///
   /// - Complexity: O(1).
-  public func makeIterator() -> JoinedIterator<Base.Iterator> {
-    return JoinedIterator(
-      base: _base.makeIterator(),
-      separator: _separator)
+  @_inlineable // FIXME(sil-serialize-all)
+  public func makeIterator() -> Iterator {
+    return Iterator(base: _base.makeIterator(), separator: _separator)
   }
 
-  public func _copyToContiguousArray()
-    -> ContiguousArray<Base.Iterator.Element.Iterator.Element> {
-    var result = ContiguousArray<Iterator.Element>()
+  @_inlineable // FIXME(sil-serialize-all)
+  public func _copyToContiguousArray() -> ContiguousArray<Element> {
+    var result = ContiguousArray<Element>()
     let separatorSize: Int = numericCast(_separator.count)
 
     let reservation = _base._preprocessingPass {
@@ -145,13 +166,9 @@ public struct JoinedSequence<Base : Sequence> : Sequence
 
     return result
   }
-
-  internal var _base: Base
-  internal var _separator:
-    ContiguousArray<Base.Iterator.Element.Iterator.Element>
 }
-
-extension Sequence where Iterator.Element : Sequence {
+  
+extension Sequence where Element : Sequence {
   /// Returns the concatenated elements of this sequence of sequences,
   /// inserting the given separator between each element.
   ///
@@ -166,33 +183,14 @@ extension Sequence where Iterator.Element : Sequence {
   /// - Parameter separator: A sequence to insert between each of this
   ///   sequence's elements.
   /// - Returns: The joined sequence of elements.
-  ///
-  /// - SeeAlso: `joined()`
+  @_inlineable // FIXME(sil-serialize-all)
   public func joined<Separator : Sequence>(
     separator: Separator
   ) -> JoinedSequence<Self>
-    where Separator.Iterator.Element == Iterator.Element.Iterator.Element {
+    where Separator.Element == Element.Element {
     return JoinedSequence(base: self, separator: separator)
   }
 }
 
-@available(*, unavailable, renamed: "JoinedIterator")
-public struct JoinGenerator<Base : IteratorProtocol>
-  where Base.Element : Sequence {}
-
-extension JoinedSequence {
-  @available(*, unavailable, renamed: "makeIterator()")
-  public func generate() -> JoinedIterator<Base.Iterator> {
-    Builtin.unreachable()
-  }
-}
-
-extension Sequence where Iterator.Element : Sequence {
-  @available(*, unavailable, renamed: "joined(separator:)")
-  public func joinWithSeparator<Separator : Sequence>(
-    _ separator: Separator
-  ) -> JoinedSequence<Self>
-    where Separator.Iterator.Element == Iterator.Element.Iterator.Element {
-    Builtin.unreachable()
-  }
-}
+// @available(*, deprecated, renamed: "JoinedSequence.Iterator")
+public typealias JoinedIterator<T: Sequence> = JoinedSequence<T>.Iterator where T.Element: Sequence

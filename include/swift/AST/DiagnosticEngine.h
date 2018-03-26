@@ -123,10 +123,12 @@ namespace swift {
       : Kind(DiagnosticArgumentKind::Unsigned), UnsignedVal(I) {
     }
 
-    DiagnosticArgument(DeclName I)
-      : Kind(DiagnosticArgumentKind::Identifier), IdentifierVal(I) {
-    }
-    
+    DiagnosticArgument(DeclName D)
+        : Kind(DiagnosticArgumentKind::Identifier), IdentifierVal(D) {}
+
+    DiagnosticArgument(DeclBaseName D)
+        : Kind(DiagnosticArgumentKind::Identifier), IdentifierVal(D) {}
+
     DiagnosticArgument(Identifier I)
       : Kind(DiagnosticArgumentKind::Identifier), IdentifierVal(I) {
     }
@@ -433,6 +435,7 @@ namespace swift {
       Unspecified,
       Ignore,
       Note,
+      Remark,
       Warning,
       Error,
       Fatal,
@@ -741,6 +744,10 @@ namespace swift {
     /// \returns true if diagnostic is marked with PointsToFirstBadToken
     /// option.
     bool isDiagnosticPointsToFirstBadToken(DiagID id) const;
+
+    /// \returns true if any diagnostic consumer gave an error while invoking
+    //// \c finishProcessing.
+    bool finishProcessing();
     
     /// \brief Format the given diagnostic text and place the result in the given
     /// buffer.
