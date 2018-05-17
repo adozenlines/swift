@@ -33,11 +33,14 @@ namespace swiftcall {
 
 namespace swift {
   class EnumElementDecl;
-  
+  enum IsInitialization_t : bool;
+  enum IsTake_t : bool;
+
 namespace irgen {
   class EnumPayload;
   class EnumPayloadSchema;
   class IRGenFunction;
+  class MetadataDependencyCollector;
   class TypeConverter;
   using clang::CodeGen::swiftcall::SwiftAggLowering;
 
@@ -135,6 +138,7 @@ protected:
   const TypeInfo *TI = nullptr;
   TypeInfoKind TIK;
   IsFixedSize_t AlwaysFixedSize;
+  IsABIAccessible_t ElementsAreABIAccessible;
   unsigned NumElements;
   
   EnumImplStrategy(IRGenModule &IGM,
@@ -142,12 +146,7 @@ protected:
                    IsFixedSize_t alwaysFixedSize,
                    unsigned NumElements,
                    std::vector<Element> &&ElementsWithPayload,
-                   std::vector<Element> &&ElementsWithNoPayload)
-  : ElementsWithPayload(std::move(ElementsWithPayload)),
-    ElementsWithNoPayload(std::move(ElementsWithNoPayload)),
-    IGM(IGM), TIK(tik), AlwaysFixedSize(alwaysFixedSize),
-    NumElements(NumElements)
-  {}
+                   std::vector<Element> &&ElementsWithNoPayload);
   
   /// Save the TypeInfo created for the enum.
   TypeInfo *registerEnumTypeInfo(TypeInfo *mutableTI) {
@@ -369,7 +368,8 @@ public:
   virtual void initializeMetadata(IRGenFunction &IGF,
                                   llvm::Value *metadata,
                                   bool isVWTMutable,
-                                  SILType T) const = 0;
+                                  SILType T,
+                              MetadataDependencyCollector *collector) const = 0;
 
   virtual bool mayHaveExtraInhabitants(IRGenModule &IGM) const = 0;
 
@@ -427,10 +427,14 @@ public:
   virtual llvm::Value *loadRefcountedPtr(IRGenFunction &IGF, SourceLoc loc,
                                          Address addr) const;
 
-  virtual void collectArchetypeMetadata(
-      IRGenFunction &IGF,
-      llvm::MapVector<CanType, llvm::Value *> &typeToMetadataVec,
-      SILType T) const = 0;
+  void callOutlinedCopy(IRGenFunction &IGF, Address dest, Address src,
+                        SILType T, IsInitialization_t isInit,
+                        IsTake_t isTake) const;
+
+  void callOutlinedDestroy(IRGenFunction &IGF, Address addr, SILType T) const;
+
+  virtual void collectMetadataForOutlining(OutliningMetadataCollector &collector,
+                                           SILType T) const = 0;
 
   virtual bool isSingleRetainablePointer(ResilienceExpansion expansion,
                                          ReferenceCounting *rc) const {
@@ -438,6 +442,9 @@ public:
   }
 
   void emitResilientTagIndices(IRGenModule &IGM) const;
+
+protected:
+
 
 private:
   EnumImplStrategy(const EnumImplStrategy &) = delete;

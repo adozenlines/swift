@@ -29,7 +29,7 @@
 using namespace swift;
 
 // FIXME: replace with std::string and StringRef as appropriate to each case.
-typedef const std::string ConstString;
+using ConstString = const std::string;
 
 static std::string stringWithFormat(const char *fmt_str, ...) {
   int final_n, n = ((int)strlen(fmt_str)) * 2;
@@ -76,7 +76,7 @@ GetClangTypeKindFromSwiftKind(DeclKind decl_kind) {
 
 class DeclsLookupSource {
 public:
-  typedef SmallVectorImpl<ValueDecl *> ValueDecls;
+  using ValueDecls = SmallVectorImpl<ValueDecl *>;
 
 private:
   class VisibleDeclsConsumer : public VisibleDeclConsumer {
@@ -124,7 +124,7 @@ public:
     Invalid
   };
 
-  typedef Optional<std::string> PrivateDeclIdentifier;
+  using PrivateDeclIdentifier = Optional<std::string>;
 
   static DeclsLookupSource
   GetDeclsLookupSource(ASTContext &ast, ConstString module_name,
@@ -596,7 +596,7 @@ FindNamedDecls(ASTContext *ast, const DeclBaseName &name, VisitNodeResult &resul
         // FIXME: Need a more complete/robust lookup mechanism that can handle
         // declarations in sub-stmts, etc.
         UnqualifiedLookup lookup(name, FD, ast->getLazyResolver(),
-                                 /*IsKnownPrivate=*/false, FD->getEndLoc());
+                                 FD->getEndLoc());
         if (!lookup.isSuccess()) {
           result._error = "no decl found in function";
         } else {
@@ -1832,7 +1832,7 @@ static void VisitNodeInOut(
   VisitNodeResult type_result;
   VisitNode(ast, cur_node->getFirstChild(), type_result);
   if (type_result._types.size() == 1 && type_result._types[0]) {
-    result._types.push_back(Type(InOutType::get(type_result._types[0])));
+    result._types.push_back(InOutType::get(type_result._types[0]));
   } else {
     result._error = "couldn't resolve referent type";
   }
@@ -2049,16 +2049,17 @@ static void VisitNodeTupleElement(
     }
   }
 
-  if (tuple_type_result._error.empty() &&
-      tuple_type_result._types.size() == 1) {
-    if (!tuple_name.empty())
-      result._tuple_type_element =
-          TupleTypeElt(tuple_type_result._types.front().getPointer(),
-                       ast->getIdentifier(tuple_name));
-    else
-      result._tuple_type_element =
-          TupleTypeElt(tuple_type_result._types.front().getPointer());
-  }
+  if (!tuple_type_result._error.empty() || tuple_type_result._types.size() != 1)
+    return;
+
+  auto tupleType = tuple_type_result._types.front();
+  auto typeFlags = ParameterTypeFlags();
+  typeFlags = typeFlags.withInOut(tupleType->is<InOutType>());
+  if (auto *inOutTy = tupleType->getAs<InOutType>())
+    tupleType = inOutTy->getObjectType();
+  Identifier idName =
+      tuple_name.empty() ? Identifier() : ast->getIdentifier(tuple_name);
+  result._tuple_type_element = TupleTypeElt(tupleType, idName, typeFlags);
 }
 
 static void VisitNodeTypeList(
@@ -2160,17 +2161,13 @@ static void VisitNodeGlobal(ASTContext *ast, Demangle::NodePointer cur_node,
                             VisitNodeResult &result) {
   assert(result._error.empty());
 
-  Demangle::Node::iterator child_end = cur_node->end();
-  for (Demangle::Node::iterator child_pos = cur_node->begin();
-       child_pos != child_end; ++child_pos) {
-    auto child = *child_pos;
-    const Demangle::Node::Kind childKind = child->getKind();
-
-    switch (childKind) {
+  for (const auto &child : *cur_node) {
+    switch (child->getKind()) {
     case Demangle::Node::Kind::Identifier:
+      result._error = "invalid global node";
       break;
     default:
-      VisitNode(ast, *child_pos, result);
+      VisitNode(ast, child, result);
       break;
     }
   }

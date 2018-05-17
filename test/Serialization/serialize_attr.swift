@@ -10,28 +10,24 @@
 // -----------------------------------------------------------------------------
 
 //CHECK-DAG: @_semantics("crazy") func foo()
-@_inlineable
-@_versioned
+@inlinable
 @_semantics("crazy") func foo() -> Int  { return 5}
 
 // @_optimize
 // -----------------------------------------------------------------------------
 
 //CHECK-DAG: @_optimize(none) func test_onone()
-@_inlineable
-@_versioned
+@inlinable
 @_optimize(none)
 func test_onone() -> Int  { return 5}
 
 //CHECK-DAG: @_optimize(speed) func test_ospeed()
-@_inlineable
-@_versioned
+@inlinable
 @_optimize(speed)
 func test_ospeed() -> Int  { return 5}
  
 //CHECK-DAG: @_optimize(size) func test_osize()
-@_inlineable
-@_versioned
+@inlinable
 @_optimize(size)
 func test_osize() -> Int  { return 5}
 
@@ -41,10 +37,15 @@ func test_osize() -> Int  { return 5}
 // These lines should be contiguous.
 // CHECK-DAG: @_specialize(exported: false, kind: full, where T == Int, U == Float)
 // CHECK-DAG: func specializeThis<T, U>(_ t: T, u: U)
-@_inlineable
-@_versioned
+@inlinable
 @_specialize(where T == Int, U == Float)
-func specializeThis<T, U>(_ t: T, u: U) {}
+func specializeThis<T, U>(_ t: T, u: U) {
+  specializeThat(t, u: u)
+}
+
+@usableFromInline
+@_specialize(where T == Int, U == Float)
+func specializeThat<T, U>(_ t: T, u: U) {}
 
 public protocol PP {
   associatedtype PElt
@@ -70,8 +71,7 @@ public struct GG<T : PP> {}
 // CHECK-DAG: @_specialize(exported: false, kind: full, where T == RR, U == SS)
 // CHECK-DAG: @inline(never) func foo<U>(_ u: U, g: GG<T>) -> (U, GG<T>) where U : QQ
 public class CC<T : PP> {
-  @_inlineable
-  @_versioned
+  @inlinable
   @inline(never)
   @_specialize(where T==RR, U==SS)
   func foo<U : QQ>(_ u: U, g: GG<T>) -> (U, GG<T>) {

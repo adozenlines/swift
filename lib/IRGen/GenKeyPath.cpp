@@ -81,6 +81,7 @@ bindPolymorphicArgumentsFromComponentIndices(IRGenFunction &IGF,
   }
   bindFromGenericRequirementsBuffer(IGF, requirements,
     Address(args, IGF.IGM.getPointerAlignment()),
+    MetadataState::Complete,
     [&](CanType t) {
       return genericEnv->mapTypeIntoContext(t)->getCanonicalType();
     });
@@ -229,8 +230,7 @@ getAccessorForComputedComponent(IRGenModule &IGM,
     // Use the bound generic metadata to form a call to the original generic
     // accessor.
     WitnessMetadata ignoreWitnessMetadata;
-    auto forwardingSubs = genericEnv->getGenericSignature()->getSubstitutionMap(
-      genericEnv->getForwardingSubstitutions());
+    auto forwardingSubs = genericEnv->getForwardingSubstitutionMap();
     emitPolymorphicArguments(IGF, accessor->getLoweredFunctionType(),
                              forwardingSubs,
                              &ignoreWitnessMetadata,
@@ -274,6 +274,7 @@ getLayoutFunctionForComputedComponent(IRGenModule &IGM,
     if (genericEnv) {
       bindFromGenericRequirementsBuffer(IGF, requirements,
         Address(args, IGF.IGM.getPointerAlignment()),
+        MetadataState::Complete,
         [&](CanType t) {
           return genericEnv->mapTypeIntoContext(t)->getCanonicalType();
         });
@@ -336,12 +337,12 @@ getWitnessTableForComputedComponent(IRGenModule &IGM,
     if (auto existing =
           IGM.Module.getNamedGlobal("swift_keyPathGenericWitnessTable"))
       return existing;
-    
-    auto linkInfo = LinkInfo::get(IGM, "swift_keyPathGenericWitnessTable",
-                                  SILLinkage::PublicExternal,
-                                  NotForDefinition,
+
+    auto linkInfo = LinkInfo::get(UniversalLinkageInfo(IGM),
+                                  "swift_keyPathGenericWitnessTable",
+                                  SILLinkage::PublicExternal, NotForDefinition,
                                   /*weak imported*/ false);
-    
+
     return createVariable(IGM, linkInfo,
                           IGM.Int8PtrTy, IGM.getPointerAlignment());
   }
@@ -547,6 +548,7 @@ getInitializerForComputedComponent(IRGenModule &IGM,
       // Bind the generic environment from the argument buffer.
       bindFromGenericRequirementsBuffer(IGF, requirements,
         Address(src, IGF.IGM.getPointerAlignment()),
+        MetadataState::Complete,
         [&](CanType t) {
           return genericEnv->mapTypeIntoContext(t)->getCanonicalType();
         });
@@ -673,6 +675,7 @@ emitGeneratorForKeyPath(IRGenModule &IGM,
       
       bindFromGenericRequirementsBuffer(IGF, requirements,
             Address(bindingsBufPtr, IGM.getPointerAlignment()),
+            MetadataState::Complete,
             [&](CanType t) {
               return genericEnv->mapTypeIntoContext(t)->getCanonicalType();
             });
@@ -749,8 +752,7 @@ emitKeyPathComponent(IRGenModule &IGM,
     SmallVector<llvm::Constant*, 4> descriptorArgs;
     auto componentSig = component.getExternalDecl()->getInnermostDeclContext()
       ->getGenericSignatureOfContext();
-    auto subs = componentSig->getSubstitutionMap(
-                                        component.getExternalSubstitutions());
+    auto subs = component.getExternalSubstitutions();
     enumerateGenericSignatureRequirements(
       componentSig->getCanonicalSignature(),
       [&](GenericRequirement reqt) {

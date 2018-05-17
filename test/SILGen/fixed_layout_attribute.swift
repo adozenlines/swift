@@ -1,8 +1,8 @@
-// RUN: %target-swift-frontend -emit-silgen -enable-sil-ownership -parse-as-library %s | %FileCheck %s --check-prefix=FRAGILE --check-prefix=CHECK
-// RUN: %target-swift-frontend -enable-resilience -emit-silgen -enable-sil-ownership -parse-as-library %s | %FileCheck %s --check-prefix=RESILIENT --check-prefix=CHECK
+// RUN: %target-swift-emit-silgen -enable-sil-ownership -parse-as-library %s | %FileCheck %s --check-prefix=FRAGILE --check-prefix=CHECK
+// RUN: %target-swift-emit-silgen -enable-resilience -enable-sil-ownership -parse-as-library %s | %FileCheck %s --check-prefix=RESILIENT --check-prefix=CHECK
 
-// RUN: %target-swift-frontend -emit-silgen -enable-sil-ownership -parse-as-library -enable-testing %s
-// RUN: %target-swift-frontend -emit-silgen -enable-sil-ownership -parse-as-library -enable-testing -enable-resilience %s
+// RUN: %target-swift-emit-silgen -enable-sil-ownership -parse-as-library -enable-testing %s
+// RUN: %target-swift-emit-silgen -enable-sil-ownership -parse-as-library -enable-testing -enable-resilience %s
 
 public let global = 0
 
@@ -64,9 +64,9 @@ public func usesStaticProperty() {
   _ = HasStaticProperty.staticProperty
 }
 
-// CHECK-LABEL: sil [serialized] @$S22fixed_layout_attribute28usesStaticPropertyInlineableyyF : $@convention(thin) () -> ()
+// CHECK-LABEL: sil [serialized] @$S22fixed_layout_attribute27usesStaticPropertyInlinableyyF : $@convention(thin) () -> ()
 
-@_inlineable
-public func usesStaticPropertyInlineable() {
+@inlinable
+public func usesStaticPropertyInlinable() {
   _ = HasStaticProperty.staticProperty
 }

@@ -37,7 +37,6 @@ class SILModule;
 class ProtocolConformance;
 class NormalProtocolConformance;
 enum IsSerialized_t : unsigned char;
-enum class ResilienceStrategy : unsigned;
 
 /// A mapping from each requirement of a protocol to the SIL-level entity
 /// satisfying the requirement for a concrete type.
@@ -319,7 +318,7 @@ namespace llvm {
 template <>
 struct ilist_traits<::swift::SILWitnessTable> :
 public ilist_default_traits<::swift::SILWitnessTable> {
-  typedef ::swift::SILWitnessTable SILWitnessTable;
+  using SILWitnessTable = ::swift::SILWitnessTable;
 
 public:
   static void deleteNode(SILWitnessTable *WT) { WT->~SILWitnessTable(); }

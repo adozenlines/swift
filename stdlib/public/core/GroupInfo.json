@@ -10,6 +10,7 @@
     "CharacterUnicodeScalars.swift",
     "ICU.swift",
     "NormalizedCodeUnitIterator.swift",
+    "SmallString.swift",
     "StaticString.swift",
     "String.swift",
     "StringBridge.swift",
@@ -134,7 +135,6 @@
     "BuiltinMath.swift",
     {
     "Integers": [
-      "DoubleWidth.swift",
       "Integers.swift",
       "IntegerParsing.swift"],
     "Floating": [
@@ -165,6 +165,7 @@
     "Interval.swift",
     "Hashing.swift",
     "SipHash.swift",
+    "Hasher.swift",
     "ErrorType.swift",
     "InputStream.swift",
     "LifetimeManager.swift",
@@ -175,6 +176,7 @@
     "Policy.swift",
     "Print.swift",
     "REPL.swift",
+    "Random.swift",
     "Runtime.swift",
     "RuntimeFunctionCounters.swift",
     "Shims.swift",

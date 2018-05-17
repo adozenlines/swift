@@ -81,6 +81,9 @@ def verify_generic_signatures : Separate<["-"], "verify-generic-signatures">,
   MetaVarName<"<module-name>">,
   HelpText<"Verify the generic signatures in the given module">;
 
+def verify_syntax_tree : Flag<["-"], "verify-syntax-tree">,
+  HelpText<"Verify that no unknown nodes exist in the libSyntax tree">;
+
 def show_diagnostics_after_fatal : Flag<["-"], "show-diagnostics-after-fatal">,
   HelpText<"Keep emitting subsequent diagnostics after a fatal error">;
 
@@ -214,8 +217,8 @@ def disable_llvm_optzns : Flag<["-"], "disable-llvm-optzns">,
 def disable_sil_perf_optzns : Flag<["-"], "disable-sil-perf-optzns">,
   HelpText<"Don't run SIL performance optimization passes">;
 
-def disable_llvm_arc_opts : Flag<["-"], "disable-llvm-arc-opts">,
-  HelpText<"Don't run LLVM ARC optimization passes.">;
+def disable_swift_specific_llvm_optzns : Flag<["-"], "disable-swift-specific-llvm-optzns">,
+  HelpText<"Don't run Swift specific LLVM optimization passes.">;
 
 def disable_llvm_slp_vectorizer : Flag<["-"], "disable-llvm-slp-vectorizer">,
   HelpText<"Don't run LLVM SLP vectorizer">;
@@ -243,9 +246,6 @@ def stack_promotion_limit : Separate<["-"], "stack-promotion-limit">,
   HelpText<"Limit the size of stack promoted objects to the provided number "
            "of bytes.">;
 
-def disable_sil_linking : Flag<["-"], "disable-sil-linking">,
-  HelpText<"Don't link SIL functions">;
-
 def dump_clang_diagnostics : Flag<["-"], "dump-clang-diagnostics">,
   HelpText<"Dump Clang diagnostics to stderr">;
 
@@ -264,8 +264,8 @@ def pch_disable_validation : Flag<["-"], "pch-disable-validation">,
 def enable_sil_ownership : Flag<["-"], "enable-sil-ownership">,
   HelpText<"Enable the SIL Ownership Model">;
 
-def enable_guaranteed_normal_arguments : Flag<["-"], "enable-guaranteed-normal-arguments">,
-  HelpText<"If set to true, all normal parameters (except to inits/setters) will be passed at +0">;
+def disable_guaranteed_normal_arguments : Flag<["-"], "disable-guaranteed-normal-arguments">,
+  HelpText<"If set to true, all normal parameters (except to inits/setters) will be passed at +1">;
 
 def disable_mandatory_semantic_arc_opts : Flag<["-"], "disable-mandatory-semantic-arc-opts">,
   HelpText<"Disable the mandatory semantic arc optimizer">;
@@ -345,6 +345,9 @@ def warn_long_expression_type_checking_EQ : Joined<["-"], "warn-long-expression-
 
 def solver_expression_time_threshold_EQ : Joined<["-"], "solver-expression-time-threshold=">;
 
+def switch_checking_invocation_threshold_EQ : Joined<["-"],
+    "switch-checking-invocation-threshold=">;
+
 def enable_source_import : Flag<["-"], "enable-source-import">,
   HelpText<"Enable importing of Swift source files">;
 
@@ -356,6 +359,10 @@ def import_module : Separate<["-"], "import-module">,
 
 def print_stats : Flag<["-"], "print-stats">,
   HelpText<"Print various statistics">;
+
+def debugger_testing_transform : Flag<["-"], "debugger-testing-transform">,
+  HelpText<"Instrument the code with calls to an intrinsic that record the expected values of "
+           "local variables so they can be compared against the results from the debugger.">;
 
 def playground : Flag<["-"], "playground">,
   HelpText<"Apply the playground semantics and transformation">;
@@ -388,9 +395,6 @@ def sil_unroll_threshold : Separate<["-"], "sil-unroll-threshold">,
 
 def sil_merge_partial_modules : Flag<["-"], "sil-merge-partial-modules">,
   HelpText<"Merge SIL from all partial swiftmodules into the final module">;
-
-def sil_link_all : Flag<["-"], "sil-link-all">,
-  HelpText<"Link all SIL functions">;
 
 def sil_verify_all : Flag<["-"], "sil-verify-all">,
   HelpText<"Verify SIL after each transform">;
@@ -448,6 +452,12 @@ def dump_api_path : Separate<["-"], "dump-api-path">,
 def enable_resilience : Flag<["-"], "enable-resilience">,
    HelpText<"Compile the module to export resilient interfaces for all "
             "public declarations by default">;
+
+def enable_class_resilience : Flag<["-"], "enable-class-resilience">,
+   HelpText<"Enable resilient layout for classes containing resilient value types">;
+
+def enable_resilience_bypass : Flag<["-"], "enable-resilience-bypass">,
+   HelpText<"Completely bypass resilience when accessing types in resilient frameworks">;
 
 def group_info_path : Separate<["-"], "group-info-path">,
   HelpText<"The path to collect the group information of the compiled module">;

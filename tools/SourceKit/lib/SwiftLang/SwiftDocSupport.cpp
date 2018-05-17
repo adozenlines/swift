@@ -209,6 +209,7 @@ public:
     initDefaultMapToUse(D);
     // If D is declared in the extension, then the synthesized target is valid.
     TypeOrExtensionDecl SynthesizedTarget;
+    assert(D->getDeclContext()->isModuleScopeContext() == EntitiesStack.empty());
     if (D->getDeclContext() == SynthesizedExtensionInfo.first)
       SynthesizedTarget = SynthesizedExtensionInfo.second;
     EntitiesStack.emplace_back(D, SynthesizedTarget,
@@ -455,10 +456,8 @@ static bool initDocEntityInfo(const TextEntity &Entity,
 }
 
 static const TypeDecl *getTypeDeclFromType(Type Ty) {
-  if (auto Alias = dyn_cast<NameAliasType>(Ty.getPointer()))
-    return Alias->getDecl();
-  if (auto BoundAlias = dyn_cast<BoundNameAliasType>(Ty.getPointer()))
-    return BoundAlias->getDecl();
+  if (auto alias = dyn_cast<NameAliasType>(Ty.getPointer()))
+    return alias->getDecl();
   return Ty->getAnyNominal();
 }
 

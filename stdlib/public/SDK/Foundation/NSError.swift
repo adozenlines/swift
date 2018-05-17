@@ -109,7 +109,7 @@ public protocol RecoverableError : Error {
   /// "document" granularity, that do not affect the entire
   /// application.
   func attemptRecovery(optionIndex recoveryOptionIndex: Int,
-                       resultHandler handler: (_ recovered: Bool) -> Void)
+                       resultHandler handler: @escaping (_ recovered: Bool) -> Void)
 
   /// Attempt to recover from this error when the user selected the
   /// option at the given index. Returns true to indicate
@@ -127,7 +127,7 @@ public extension RecoverableError {
   /// mechanism (``attemptRecovery(optionIndex:)``) to implement
   /// document-modal recovery.
   func attemptRecovery(optionIndex recoveryOptionIndex: Int,
-                       resultHandler handler: (_ recovered: Bool) -> Void) {
+                       resultHandler handler: @escaping (_ recovered: Bool) -> Void) {
     handler(attemptRecovery(optionIndex: recoveryOptionIndex))
   }
 }
@@ -529,12 +529,12 @@ extension _BridgedStoredNSError {
 }
 
 extension _SwiftNewtypeWrapper where Self.RawValue == Error {
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // FIXME(sil-serialize-all)
   public func _bridgeToObjectiveC() -> NSError {
     return rawValue as NSError
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // FIXME(sil-serialize-all)
   public static func _forceBridgeFromObjectiveC(
     _ source: NSError,
     result: inout Self?
@@ -542,7 +542,7 @@ extension _SwiftNewtypeWrapper where Self.RawValue == Error {
     result = Self(rawValue: source)
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // FIXME(sil-serialize-all)
   public static func _conditionallyBridgeFromObjectiveC(
     _ source: NSError,
     result: inout Self?
@@ -551,7 +551,7 @@ extension _SwiftNewtypeWrapper where Self.RawValue == Error {
     return result != nil
   }
 
-  @_inlineable // FIXME(sil-serialize-all)
+  @inlinable // FIXME(sil-serialize-all)
   public static func _unconditionallyBridgeFromObjectiveC(
     _ source: NSError?
   ) -> Self {
