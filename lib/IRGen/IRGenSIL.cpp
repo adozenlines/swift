@@ -737,6 +737,8 @@ public:
       return;
 
     llvm::IRBuilder<> ZeroInitBuilder(AI->getNextNode());
+
+    // No debug location is how LLVM marks prologue instructions.
     ZeroInitBuilder.SetCurrentDebugLocation(nullptr);
     auto *BC =
         ZeroInitBuilder.CreateBitCast(AI, IGM.OpaquePtrTy->getPointerTo());
@@ -1771,8 +1773,8 @@ void IRGenSILFunction::visitSILBasicBlock(SILBasicBlock *BB) {
   for (auto &I : *BB) {
     if (IGM.DebugInfo) {
       // Set the debug info location for I, if applicable.
-      SILLocation ILoc = I.getLoc();
       auto DS = I.getDebugScope();
+      SILLocation ILoc = I.getLoc();
       // Handle cleanup locations.
       if (ILoc.is<CleanupLocation>()) {
         // Cleanup locations point to the decl of the value that is
@@ -1830,9 +1832,8 @@ void IRGenSILFunction::visitSILBasicBlock(SILBasicBlock *BB) {
         emitDebugVariableRangeExtension(BB);
     }
     visit(&I);
-
   }
-  
+
   assert(Builder.hasPostTerminatorIP() && "SIL bb did not terminate block?!");
 }
 
@@ -3647,6 +3648,9 @@ void IRGenSILFunction::visitDebugValueInst(DebugValueInst *i) {
   if (!IGM.DebugInfo)
     return;
 
+  if (i->getDebugScope()->getInlinedFunction()->isTransparent())
+    return;
+  
   auto VarInfo = i->getVarInfo();
   assert(VarInfo && "debug_value without debug info");
   auto SILVal = i->getOperand();
@@ -3689,6 +3693,10 @@ void IRGenSILFunction::visitDebugValueInst(DebugValueInst *i) {
 void IRGenSILFunction::visitDebugValueAddrInst(DebugValueAddrInst *i) {
   if (!IGM.DebugInfo)
     return;
+
+  if (i->getDebugScope()->getInlinedFunction()->isTransparent())
+    return;
+
   VarDecl *Decl = i->getDecl();
   if (!Decl)
     return;
@@ -3968,6 +3976,9 @@ void IRGenSILFunction::emitDebugInfoForAllocStack(AllocStackInst *i,
   if (!DS)
     return;
 
+  if (i->getDebugScope()->getInlinedFunction()->isTransparent())
+    return;
+  
   bool IsAnonymous = false;
   StringRef Name = getVarName(i, IsAnonymous);
 
@@ -4171,6 +4182,9 @@ void IRGenSILFunction::visitAllocBoxInst(swift::AllocBoxInst *i) {
                                              DbgName);
   setLoweredBox(i, boxWithAddr);
 
+  if (i->getDebugScope()->getInlinedFunction()->isTransparent())
+    return;
+  
   if (IGM.DebugInfo && Decl) {
     // FIXME: This is a workaround to not produce local variables for
     // capture list arguments like "[weak self]". The better solution

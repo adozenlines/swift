@@ -1850,11 +1850,21 @@ LinkInfo LinkInfo::get(const UniversalLinkageInfo &linkInfo,
                        ModuleDecl *swiftModule, const LinkEntity &entity,
                        ForDefinition_t isDefinition) {
   LinkInfo result;
+  // FIXME: For anything in the standard library, we assume is locally defined.
+  // The only two ways imported interfaces are currently created is via a shims
+  // interface where the ClangImporter will correctly give us the proper DLL
+  // storage for the declaration.  Otherwise, it is from a `@_silgen_name`
+  // attributed declaration, which we explicitly handle elsewhere.  So, in the
+  // case of a standard library build, just assume everything is locally
+  // defined.  Ideally, we would integrate the linkage calculation properly to
+  // avoid this special casing.
+  ForDefinition_t isStdlibOrDefinition =
+      ForDefinition_t(swiftModule->isStdlibModule() || isDefinition);
 
   entity.mangle(result.Name);
   std::tie(result.Linkage, result.Visibility, result.DLLStorageClass) =
-      getIRLinkage(linkInfo, entity.getLinkage(isDefinition), isDefinition,
-                   entity.isWeakImported(swiftModule));
+      getIRLinkage(linkInfo, entity.getLinkage(isStdlibOrDefinition),
+                   isDefinition, entity.isWeakImported(swiftModule));
   result.ForDefinition = isDefinition;
   return result;
 }
@@ -2333,6 +2343,14 @@ llvm::Function *IRGenModule::getAddrOfSILFunction(SILFunction *f,
   fn = createFunction(*this, link, signature, insertBefore,
                       f->getOptimizationMode());
 
+  // If `hasCReferences` is true, then the function is either marked with
+  // @_silgen_name OR @_cdecl.  If it is the latter, it must have a definition
+  // associated with it.  The combination of the two allows us to identify the
+  // @_silgen_name functions.  These are locally defined function thunks used in
+  // the standard library.  Do not give them DLLImport DLL Storage.
+  if (useDllStorage() && f->hasCReferences() && !forDefinition)
+    fn->setDLLStorageClass(llvm::GlobalValue::DefaultStorageClass);
+
   // If we have an order number for this function, set it up as appropriate.
   if (hasOrderNumber) {
     EmittedFunctionsByOrder.insert(orderNumber, fn);
@@ -2751,10 +2769,10 @@ llvm::Constant *IRGenModule::emitSwiftProtocols() {
   StringRef sectionName;
   switch (TargetInfo.OutputObjectFormat) {
   case llvm::Triple::MachO:
-    sectionName = "__TEXT, __swift4_protos, regular, no_dead_strip";
+    sectionName = "__TEXT, __swift5_protos, regular, no_dead_strip";
     break;
   case llvm::Triple::ELF:
-    sectionName = "swift4_protocols";
+    sectionName = "swift5_protocols";
     break;
   case llvm::Triple::COFF:
     sectionName = ".sw5prt$B";
@@ -2941,10 +2959,10 @@ llvm::Constant *IRGenModule::emitProtocolConformances() {
   StringRef sectionName;
   switch (TargetInfo.OutputObjectFormat) {
   case llvm::Triple::MachO:
-    sectionName = "__TEXT, __swift4_proto, regular, no_dead_strip";
+    sectionName = "__TEXT, __swift5_proto, regular, no_dead_strip";
     break;
   case llvm::Triple::ELF:
-    sectionName = "swift4_protocol_conformances";
+    sectionName = "swift5_protocol_conformances";
     break;
   case llvm::Triple::COFF:
     sectionName = ".sw5prtc$B";
@@ -2968,10 +2986,10 @@ llvm::Constant *IRGenModule::emitTypeMetadataRecords() {
   std::string sectionName;
   switch (TargetInfo.OutputObjectFormat) {
   case llvm::Triple::MachO:
-    sectionName = "__TEXT, __swift4_types, regular, no_dead_strip";
+    sectionName = "__TEXT, __swift5_types, regular, no_dead_strip";
     break;
   case llvm::Triple::ELF:
-    sectionName = "swift4_type_metadata";
+    sectionName = "swift5_type_metadata";
     break;
   case llvm::Triple::COFF:
     sectionName = ".sw5tymd$B";
@@ -3035,13 +3053,13 @@ llvm::Constant *IRGenModule::emitFieldDescriptors() {
   std::string sectionName;
   switch (TargetInfo.OutputObjectFormat) {
   case llvm::Triple::MachO:
-    sectionName = "__TEXT, __swift4_fieldmd, regular, no_dead_strip";
+    sectionName = "__TEXT, __swift5_fieldmd, regular, no_dead_strip";
     break;
   case llvm::Triple::ELF:
-    sectionName = "swift4_fieldmd";
+    sectionName = "swift5_fieldmd";
     break;
   case llvm::Triple::COFF:
-    sectionName = ".swift4_fieldmd";
+    sectionName = ".swift5_fieldmd";
     break;
   default:
     llvm_unreachable("Don't know how to emit field records table for "

@@ -118,8 +118,7 @@ ProtocolConformanceRef::subst(Type origType,
 
   // Check the conformance map.
   if (auto result = conformances(origType->getCanonicalType(),
-                                 substType,
-                                 proto->getDeclaredType())) {
+                                 substType, proto)) {
     return *result;
   }
 
@@ -982,9 +981,8 @@ ProtocolConformance::subst(Type substType,
                == substType->getNominalOrBoundGenericNominal()
              && "substitution mapped to different nominal?!");
 
-      SubstitutionMap subMap;
-      if (auto *genericSig = getGenericSignature())
-        subMap = genericSig->getSubstitutionMap(subs, conformances);
+      auto subMap = SubstitutionMap::get(getGenericSignature(),
+                                         subs, conformances);
 
       return substType->getASTContext()
         .getSpecializedConformance(substType,

@@ -81,23 +81,23 @@ SubstitutionMap Solution::computeSubstitutions(
   auto &tc = getConstraintSystem().getTypeChecker();
 
   auto lookupConformanceFn =
-      [&](CanType original, Type replacement, ProtocolType *protoType)
+      [&](CanType original, Type replacement, ProtocolDecl *protoType)
           -> Optional<ProtocolConformanceRef> {
     if (replacement->hasError() ||
         isOpenedAnyObject(replacement) ||
         replacement->is<GenericTypeParamType>()) {
-      return ProtocolConformanceRef(protoType->getDecl());
+      return ProtocolConformanceRef(protoType);
     }
 
-    return tc.conformsToProtocol(replacement,
-                                 protoType->getDecl(),
+    return tc.conformsToProtocol(replacement, protoType,
                                  getConstraintSystem().DC,
                                  (ConformanceCheckFlags::InExpression|
                                   ConformanceCheckFlags::Used));
   };
 
-  return sig->getSubstitutionMap(QueryTypeSubstitutionMap{subs},
-                                 lookupConformanceFn);
+  return SubstitutionMap::get(sig,
+                              QueryTypeSubstitutionMap{subs},
+                              lookupConformanceFn);
 }
 
 /// \brief Find a particular named function witness for a type that conforms to
@@ -358,16 +358,6 @@ diagnoseInvalidDynamicConstructorReferences(ConstraintSystem &cs,
       [&](const Expr *expr) -> Type {
         return cs.getType(expr);
       });
-
-  // 'super.' is always OK
-  if (isa<SuperRefExpr>(base))
-    return true;
-
-  // 'self.' reference with concrete type is OK
-  if (isa<DeclRefExpr>(base) &&
-      cast<DeclRefExpr>(base)->getDecl()->getBaseName() == tc.Context.Id_self &&
-      !baseTy->is<ArchetypeType>())
-    return true;
 
   // FIXME: The "hasClangNode" check here is a complete hack.
   if (isNonFinalClass(instanceTy) &&
@@ -759,14 +749,8 @@ namespace {
         return ctorRef->getArg();
       } else if (auto apply = dyn_cast<ApplyExpr>(expr)) {
         return apply->getFn();
-      } else if (auto memberRef = dyn_cast<MemberRefExpr>(expr)) {
-        return memberRef->getBase();
-      } else if (auto dynMemberRef = dyn_cast<DynamicMemberRefExpr>(expr)) {
-        return dynMemberRef->getBase();
-      } else if (auto subscriptRef = dyn_cast<SubscriptExpr>(expr)) {
-        return subscriptRef->getBase();
-      } else if (auto dynSubscriptRef = dyn_cast<DynamicSubscriptExpr>(expr)) {
-        return dynSubscriptRef->getBase();
+      } else if (auto lookupRef = dyn_cast<LookupExpr>(expr)) {
+        return lookupRef->getBase();
       } else if (auto load = dyn_cast<LoadExpr>(expr)) {
         return load->getSubExpr();
       } else if (auto inout = dyn_cast<InOutExpr>(expr)) {
@@ -1831,12 +1815,13 @@ namespace {
       // so we need to form substitutions and compute the resulting type.
       auto genericSig = fn->getGenericSignature();
 
-      auto subMap = genericSig->getSubstitutionMap(
+      auto subMap = SubstitutionMap::get(
+        genericSig,
         [&](SubstitutableType *type) -> Type {
           assert(type->isEqual(genericSig->getGenericParams()[0]));
           return valueType;
         },
-        [&](CanType origType, Type replacementType, ProtocolType *protoType)
+        [&](CanType origType, Type replacementType, ProtocolDecl *protoType)
           -> ProtocolConformanceRef {
           assert(bridgedToObjectiveCConformance);
           return *bridgedToObjectiveCConformance;
@@ -1865,7 +1850,6 @@ namespace {
       return bridgeFromObjectiveC(object, valueType, false);
     }
 
-    TypeAliasDecl *MaxIntegerTypeDecl = nullptr;
     TypeAliasDecl *MaxFloatTypeDecl = nullptr;
     
   public:
@@ -1928,28 +1912,6 @@ namespace {
         }
       }
 
-      // Find the maximum-sized builtin integer type.
-      
-      if (!MaxIntegerTypeDecl) {
-        SmallVector<ValueDecl *, 1> lookupResults;
-        tc.getStdlibModule(dc)->lookupValue(/*AccessPath=*/{},
-                                            tc.Context.Id_MaxBuiltinIntegerType,
-                                            NLKind::QualifiedLookup,
-                                            lookupResults);
-        if (lookupResults.size() == 1) {
-          MaxIntegerTypeDecl = dyn_cast<TypeAliasDecl>(lookupResults.front());
-          tc.validateDecl(MaxIntegerTypeDecl);
-        }
-      }
-      if (!MaxIntegerTypeDecl ||
-          !MaxIntegerTypeDecl->hasInterfaceType() ||
-          !MaxIntegerTypeDecl->getDeclaredInterfaceType()->is<BuiltinIntegerType>()) {
-        tc.diagnose(expr->getLoc(), diag::no_MaxBuiltinIntegerType_found);
-        return nullptr;
-      }
-      tc.validateDecl(MaxIntegerTypeDecl);
-      auto maxType = MaxIntegerTypeDecl->getUnderlyingTypeLoc().getType();
-
       DeclName initName(tc.Context, DeclBaseName::createConstructor(),
                         { tc.Context.Id_integerLiteral });
       DeclName builtinInitName(tc.Context, DeclBaseName::createConstructor(),
@@ -1963,7 +1925,9 @@ namespace {
                tc.Context.Id_IntegerLiteralType,
                initName,
                builtinProtocol,
-               maxType,
+               // Note that 'MaxIntegerType' is guaranteed to be available.
+               // Otherwise it would be caught by CSGen::visitLiteralExpr
+               tc.getMaxIntegerType(dc),
                builtinInitName,
                nullptr,
                diag::integer_literal_broken_proto,
@@ -2698,7 +2662,7 @@ namespace {
         ApplyExpr *apply = CallExpr::create(
             tc.Context, result, arg, expr->getArgumentLabels(),
             expr->getArgumentLabelLocs(), expr->hasTrailingClosure(),
-            /*implicit=*/false, Type(), getType);
+            /*implicit=*/expr->isImplicit(), Type(), getType);
         result = finishApply(apply, Type(), cs.getConstraintLocator(expr));
       }
 
@@ -2723,12 +2687,6 @@ namespace {
 
       auto *ctor = cast<ConstructorDecl>(choice.getDecl());
 
-      // If the member is a constructor, verify that it can be legally
-      // referenced from this base.
-      if (!diagnoseInvalidDynamicConstructorReferences(cs, base, nameLoc,
-                                                       ctor, SuppressDiagnostics))
-        return nullptr;
-
       // If the subexpression is a metatype, build a direct reference to the
       // constructor.
       if (cs.getType(base)->is<AnyMetatypeType>()) {
@@ -2750,6 +2708,17 @@ namespace {
           if (dre->getDecl()->getFullName() == cs.getASTContext().Id_self) {
             // We have a reference to 'self'.
             diagnoseBadInitRef = false;
+
+            // Special case -- in a protocol extension initializer with a class
+            // constrainted Self type, 'self' has archetype type, and only
+            // required initializers can be called.
+            if (cs.getType(dre)->getRValueType()->is<ArchetypeType>()) {
+              if (!diagnoseInvalidDynamicConstructorReferences(cs, base,
+                                                               nameLoc,
+                                                               ctor,
+                                                               SuppressDiagnostics))
+                return nullptr;
+            }
 
             // Make sure the reference to 'self' occurs within an initializer.
             if (!dyn_cast_or_null<ConstructorDecl>(
@@ -3686,10 +3655,7 @@ namespace {
       auto *locator = cs.getConstraintLocator(expr);
 
       if (!choice) {
-        if (tc.Context.LangOpts.EnableObjCInterop)
-          choice = solution.getDisjunctionChoice(locator);
-        else
-          choice = 0;
+        choice = solution.getDisjunctionChoice(locator);
       }
 
       // Handle the coercion/bridging of the underlying subexpression, where

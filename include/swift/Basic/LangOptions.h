@@ -223,9 +223,6 @@ namespace swift {
     /// Enables key path resilience.
     bool EnableKeyPathResilience = false;
 
-    /// Enables public emission of private metadata accessors.
-    bool EmitPublicTypeMetadataAccessors = false;
-
     /// If set to true, the diagnosis engine can assume the emitted diagnostics
     /// will be used in editor. This usually leads to more aggressive fixit.
     bool DiagnosticsEditorMode = false;
@@ -261,7 +258,9 @@ namespace swift {
     /// Whether collect tokens during parsing for syntax coloring.
     bool CollectParsedToken = false;
 
-    /// Whether to parse syntax tree.
+    /// Whether to parse syntax tree. If the syntax tree is built, the generated
+    /// AST may not be correct when syntax nodes are reused as part of
+    /// incrementals parsing.
     bool BuildSyntaxTree = false;
 
     /// Whether to verify the parsed syntax tree and emit related diagnostics.

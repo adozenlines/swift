@@ -2837,8 +2837,8 @@ bool ASTContext::diagnoseObjCUnsatisfiedOptReqConflicts(SourceFile &sf) {
                    true,
                    classDecl->getFullName(),
                    protocolName);
-    Diags.diagnose(req, diag::protocol_requirement_here,
-                   reqDiagInfo.second);
+    Diags.diagnose(req, diag::kind_declname_declared_here,
+                   DescriptiveDeclKind::Requirement, reqDiagInfo.second);
 
     anyDiagnosed = true;
   }
@@ -2874,7 +2874,7 @@ StringRef ASTContext::getSwiftName(KnownFoundationEntity kind) {
 //===----------------------------------------------------------------------===//
 
 NameAliasType::NameAliasType(TypeAliasDecl *typealias, Type parent,
-                             const SubstitutionMap &substitutions,
+                             SubstitutionMap substitutions,
                              Type underlying,
                              RecursiveTypeProperties properties)
     : SugarType(TypeKind::NameAlias, underlying, properties),
@@ -2897,7 +2897,7 @@ NameAliasType::NameAliasType(TypeAliasDecl *typealias, Type parent,
 }
 
 NameAliasType *NameAliasType::get(TypeAliasDecl *typealias, Type parent,
-                                  const SubstitutionMap &substitutions,
+                                  SubstitutionMap substitutions,
                                   Type underlying) {
   // Compute the recursive properties.
   //
@@ -2950,7 +2950,7 @@ void NameAliasType::Profile(llvm::FoldingSetNodeID &id) const {
 void NameAliasType::Profile(
                            llvm::FoldingSetNodeID &id,
                            TypeAliasDecl *typealias,
-                           Type parent, const SubstitutionMap &substitutions,
+                           Type parent, SubstitutionMap substitutions,
                            Type underlying) {
   id.AddPointer(typealias);
   id.AddPointer(parent.getPointer());
@@ -4934,8 +4934,9 @@ CanSILBoxType SILBoxType::get(CanType boxedType) {
                                SILField(CanType(genericParam),
                                         /*mutable*/ true));
 
-  SubstitutionMap subMap =
-    singleGenericParamSignature->getSubstitutionMap(
+  auto subMap =
+    SubstitutionMap::get(
+      singleGenericParamSignature,
       [&](SubstitutableType *type) -> Type {
         if (type->isEqual(genericParam)) return boxedType;
 
