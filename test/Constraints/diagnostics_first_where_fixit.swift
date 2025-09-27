@@ -1,11 +1,3 @@
-//
-//  diagnostics_first_where_fixit.swift
-//  
-//
-//  Created by Sean Batson on 2025-09-26.
-//
-
-
 // RUN: %target-typecheck-verify-swift
 
 func h(_ xs: [String]) {

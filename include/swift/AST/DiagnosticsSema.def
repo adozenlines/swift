@@ -277,6 +277,9 @@ ERROR(cannot_provide_default_value_inout,none,
 ERROR(cannot_call_non_function_value,none,
       "cannot call value of non-function type %0", (Type))
 
+NOTE(while_matching_trailing_closure_to_candidate, none,
+     "while matching trailing closure to '%0'", (DeclName))
+
 ERROR(no_candidates_match_result_type,none,
       "no '%0' candidates produce the expected contextual result type %1",
       (StringRef, Type))

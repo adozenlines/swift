@@ -47,10 +47,50 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SmallString.h"
+#include "TypeChecker.h"
 #include <string>
 
 using namespace swift;
 using namespace constraints;
+
+using namespace TypeChecker;
+
+static SmallVector<ValueDecl *, 2>
+findCallableOverloadsAcceptingClosure(DeclContext *DC,
+                                      Type baseTy,
+                                      DeclNameRef memberName,
+                                      SourceLoc loc) {
+  SmallVector<ValueDecl *, 2> results;
+  if (!baseTy || !baseTy->getAnyNominal() || !memberName)
+    return results;
+
+  // Default member lookup flags (qualified lookup, include extensions, etc.)
+
+  auto lookup = TypeChecker::lookupMember(DC,
+                                          baseTy,
+                                          memberName,
+                                          loc);
+  for (const auto &entry : lookup) {
+    if (auto *FD = dyn_cast<FuncDecl>(entry.getValueDecl())) {
+      if (FD->isKind(DeclKind::Accessor)) continue;
+
+      // Peel through (possibly curried) function types and see if any param is a closure.
+      auto ty = FD->getInterfaceType()->getAs<AnyFunctionType>();
+      while (ty) {
+        for (const auto &param : ty->getParams()) {
+          auto pty = param.getPlainType()->getRValueType();
+          if (pty->is<AnyFunctionType>()) {
+            results.push_back(FD);
+            goto next_decl;
+          }
+        }
+        ty = ty->getResult()->getAs<AnyFunctionType>(); // next curry layer
+      }
+    }
+  next_decl:;
+  }
+  return results;
+}
 
 static bool hasFixFor(const Solution &solution, ConstraintLocator *locator) {
   return llvm::any_of(solution.Fixes, [&locator](const ConstraintFix *fix) {
@@ -7913,6 +7953,9 @@ bool ExpandArrayIntoVarargsFailure::diagnoseAsNote() {
 bool ExtraneousCallFailure::diagnoseAsError() {
   auto anchor = getAnchor();
   auto *locator = getLocator();
+  auto &ctx = getASTContext();
+  auto &CS = getConstraintSystem(); // available in Failure subclasses
+  auto DC = CS.DC;
 
   // If this is something like `foo()` where `foo` is a variable
   // or a property, let's suggest dropping `()`.
@@ -7928,13 +7971,77 @@ bool ExtraneousCallFailure::diagnoseAsError() {
     if (auto *decl = overload->choice.getDeclOrNull()) {
       if (auto *enumCase = dyn_cast<EnumElementDecl>(decl)) {
         auto diagnostic =
-            emitDiagnostic(diag::unexpected_arguments_in_enum_case,
-                           enumCase);
+            emitDiagnostic(diag::unexpected_arguments_in_enum_case, enumCase);
         removeParensFixIt(diagnostic);
         return true;
       }
     }
   }
+
+  // ---- QoI probe: trailing-closure on member where same-named callable exists.
+  
+  if (auto *AE = getAsExpr<ApplyExpr>(anchor)) {
+    Expr *callee = AE->getFn();
+
+    // Use the existing locator machinery to find the argument list
+    // (so we can test for trailing closures).
+    auto *argLoc =
+        getConstraintLocator(getRawAnchor(), ConstraintLocator::ApplyArgument);
+    if (auto *argList = getArgumentListFor(argLoc)) {
+      const bool hasTrailingClosure = argList->hasAnyTrailingClosures();
+
+      if (hasTrailingClosure &&
+          (isa<MemberRefExpr>(callee) || isa<UnresolvedDotExpr>(callee))) {
+
+        // Extract member name + base expression.
+        DeclNameRef memberName;
+        Expr *base = nullptr;
+        if (auto *MRE = dyn_cast<MemberRefExpr>(callee)) {
+          memberName = DeclNameRef(MRE->getMember().getDecl()->getName());
+          base = MRE->getBase();
+        } else {
+          auto *UDE = cast<UnresolvedDotExpr>(callee);
+          memberName = DeclNameRef(UDE->getName().getBaseName());
+          base = UDE->getBase();
+        }
+
+        if (base && memberName) {
+          auto baseTy = CS.getType(base)->getRValueType();
+
+          // Look for same-named callable overloads that accept a closure.
+          auto candidates =
+              findCallableOverloadsAcceptingClosure(DC, baseTy, memberName, callee->getLoc());
+
+          if (!candidates.empty()) {
+            // Build a shallow probe: copy the callee and reuse the same arg list.
+            Expr *probeCallee = callee;
+            Expr *probeApply = CallExpr::createImplicit(ctx, probeCallee, argList);
+
+            // Re-typecheck with diagnostics enabled, but keep them transactional
+            // so we can decide whether to keep or discard.
+            DiagnosticTransaction txn(ctx.Diags);
+            // Intentionally do NOT suppress warnings here; we want any closure-body error.
+            (void)TypeChecker::typeCheckExpression(probeApply, DC, {});
+
+            const bool producedInnerDiagnostics = txn.hasErrors();
+            if (producedInnerDiagnostics) {
+              // Keep the closure-body diagnostics and add a clarifying note.
+              txn.commit();
+              ctx.Diags.diagnose(callee->getLoc(),
+                                 diag::while_matching_trailing_closure_to_candidate,
+                                 candidates.front()->getName());
+              return true; // handled: don't emit the misleading non-function error
+            } else {
+              // No inner errors: drop any incidental messages from the probe.
+              txn.abort();
+              // Fall through to the normal "cannot call non-function" path.
+            }
+          }
+        }
+      }
+    }
+  }
+  // ---- End QoI probe ----
 
   auto diagnostic =
       emitDiagnostic(diag::cannot_call_non_function_value, getType(anchor));
