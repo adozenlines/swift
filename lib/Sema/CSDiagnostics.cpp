@@ -54,6 +54,7 @@ using namespace swift;
 using namespace constraints;
 
 using namespace TypeChecker;
+using swift::NameLookupFlags;
 
 static SmallVector<ValueDecl *, 2>
 findCallableOverloadsAcceptingClosure(DeclContext *DC,
@@ -65,26 +66,25 @@ findCallableOverloadsAcceptingClosure(DeclContext *DC,
     return results;
 
   // Default member lookup flags (qualified lookup, include extensions, etc.)
-
+  NameLookupOptions lookupOptions = defaultUnqualifiedLookupOptions;
+  
   auto lookup = TypeChecker::lookupMember(DC,
                                           baseTy,
                                           memberName,
-                                          loc);
-  for (const auto &entry : lookup) {
-    if (auto *FD = dyn_cast<FuncDecl>(entry.getValueDecl())) {
-      if (FD->isKind(DeclKind::Accessor)) continue;
+                                          loc, lookupOptions);
+  for (const auto &res : lookup) {
+    auto *FD = dyn_cast<FuncDecl>(res.getValueDecl());
+    if (!FD || FD->isKind(DeclKind::Accessor)) continue;
 
-      // Peel through (possibly curried) function types and see if any param is a closure.
-      auto ty = FD->getInterfaceType()->getAs<AnyFunctionType>();
-      while (ty) {
-        for (const auto &param : ty->getParams()) {
-          auto pty = param.getPlainType()->getRValueType();
-          if (pty->is<AnyFunctionType>()) {
+    // Walk curry layers; accept any function-typed param.
+    if (auto *fnTy = FD->getInterfaceType()->getAs<AnyFunctionType>()) {
+      for (; fnTy; fnTy = fnTy->getResult()->getAs<AnyFunctionType>()) {
+        for (const auto &param : fnTy->getParams()) {
+          if (param.getPlainType()->getRValueType()->is<AnyFunctionType>()) {
             results.push_back(FD);
             goto next_decl;
           }
         }
-        ty = ty->getResult()->getAs<AnyFunctionType>(); // next curry layer
       }
     }
   next_decl:;
@@ -7954,11 +7954,9 @@ bool ExtraneousCallFailure::diagnoseAsError() {
   auto anchor = getAnchor();
   auto *locator = getLocator();
   auto &ctx = getASTContext();
-  auto &CS = getConstraintSystem(); // available in Failure subclasses
+  auto &CS = getConstraintSystem();
   auto DC = CS.DC;
 
-  // If this is something like `foo()` where `foo` is a variable
-  // or a property, let's suggest dropping `()`.
   auto removeParensFixIt = [&](InFlightDiagnostic &diagnostic) {
     auto *argLoc =
         getConstraintLocator(getRawAnchor(), ConstraintLocator::ApplyArgument);
@@ -7980,7 +7978,7 @@ bool ExtraneousCallFailure::diagnoseAsError() {
 
   // ---- QoI probe: trailing-closure on member where same-named callable exists.
   
-  if (auto *AE = getAsExpr<ApplyExpr>(anchor)) {
+  if (auto *AE = dyn_cast<ApplyExpr>(getAsExpr(anchor))) {
     Expr *callee = AE->getFn();
 
     // Use the existing locator machinery to find the argument list
@@ -8037,11 +8035,12 @@ bool ExtraneousCallFailure::diagnoseAsError() {
               // Fall through to the normal "cannot call non-function" path.
             }
           }
+          // else fall through to baseline diagnostic
         }
       }
     }
   }
-  // ---- End QoI probe ----
+  // ---------- End probe ----------
 
   auto diagnostic =
       emitDiagnostic(diag::cannot_call_non_function_value, getType(anchor));
